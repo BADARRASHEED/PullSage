@@ -22,6 +22,7 @@ class Settings(BaseSettings):
         extra="ignore",
         case_sensitive=False,
         frozen=True,
+        populate_by_name=True,
     )
 
     environment: Literal["development", "test", "staging", "production"] = Field(
@@ -129,6 +130,22 @@ class Settings(BaseSettings):
         if isinstance(value, str) and not value.strip():
             return None
         return value
+
+    @field_validator("github_token", "github_webhook_secret", mode="before")
+    @classmethod
+    def empty_secrets_are_unconfigured(cls, value: object) -> object:
+        """Treat empty example-file values as missing credentials."""
+
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
+
+    @field_validator("log_level", mode="before")
+    @classmethod
+    def normalize_log_level(cls, value: object) -> object:
+        """Accept conventional case-insensitive log-level values."""
+
+        return value.upper() if isinstance(value, str) else value
 
     def github_token_value(self) -> str | None:
         """Return the GitHub token only at the integration boundary."""
