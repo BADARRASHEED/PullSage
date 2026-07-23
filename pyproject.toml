@@ -1,0 +1,78 @@
+[project]
+name = "pullsage"
+version = "0.1.0"
+description = "MCP-enabled AI pull request review with FastAPI, GitHub APIs, and Codex"
+readme = "README.md"
+requires-python = ">=3.12,<3.14"
+license = { file = "LICENSE" }
+authors = [
+    { name = "PullSage contributors" },
+]
+keywords = ["ai", "code-review", "codex", "fastapi", "github", "mcp"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Typing :: Typed",
+]
+dependencies = [
+    "fastapi>=0.116.0,<1.0.0",
+    "httpx>=0.28.1,<1.0.0",
+    "mcp[cli]>=1.16.0,<2.0.0",
+    "pydantic>=2.11.0,<3.0.0",
+    "pydantic-settings>=2.10.0,<3.0.0",
+    "uvicorn[standard]>=0.35.0,<1.0.0",
+]
+
+[project.scripts]
+pullsage = "pullsage.cli:main"
+pullsage-api = "pullsage.cli:run_api"
+pullsage-mcp = "pullsage.mcp.server:main"
+
+[dependency-groups]
+dev = [
+    "mypy>=1.16.0,<2.0.0",
+    "pytest>=8.4.0,<9.0.0",
+    "pytest-asyncio>=1.0.0,<2.0.0",
+    "respx>=0.22.0,<1.0.0",
+    "ruff>=0.12.0,<1.0.0",
+]
+
+[build-system]
+requires = ["hatchling>=1.27.0"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/pullsage"]
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+asyncio_mode = "auto"
+pythonpath = ["src"]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC", "RUF"]
+ignore = ["B008"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_unreachable = true
+pretty = true
+show_error_codes = true
+packages = ["pullsage"]
+mypy_path = "src"
+
+[[tool.mypy.overrides]]
+module = ["mcp.*"]
+ignore_missing_imports = true
