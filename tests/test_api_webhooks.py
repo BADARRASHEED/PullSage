@@ -27,7 +27,11 @@ class _FakeCodexRunner:
 
 
 class _FakeReviewService:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+
     async def review_pull_request(self, *args: object, **kwargs: object) -> None:
+        self.calls.append({"args": args, "kwargs": kwargs})
         return None
 
 
@@ -63,8 +67,7 @@ def _signed_request(
 ):
     body = json.dumps(payload, separators=(",", ":")).encode()
     effective_signature = signature or (
-        "sha256="
-        + hmac.new(_SECRET.encode(), body, hashlib.sha256).hexdigest()
+        "sha256=" + hmac.new(_SECRET.encode(), body, hashlib.sha256).hexdigest()
     )
     return client.post(
         "/webhooks/github",
@@ -139,3 +142,58 @@ def test_unsupported_action_and_draft_pull_request_are_ignored() -> None:
     assert unsupported.json()["status"] == "ignored"
     assert draft.status_code == 202
     assert draft.json()["status"] == "ignored"
+
+
+def test_webhook_body_and_delivery_identifier_are_bounded() -> None:
+    with TestClient(_application()) as client:
+        oversized = client.post(
+            "/webhooks/github",
+            content=b"x" * (1_048_576 + 1),
+            headers={
+                "X-Hub-Signature-256": "sha256=" + ("0" * 64),
+                "X-GitHub-Event": "pull_request",
+                "X-GitHub-Delivery": "delivery-oversized",
+            },
+        )
+        invalid_delivery = _signed_request(
+            client,
+            _payload(),
+            delivery="x" * 129,
+        )
+
+    assert oversized.status_code == 413
+    assert oversized.json()["error"]["code"] == "request_body_too_large"
+    assert invalid_delivery.status_code == 400
+    assert invalid_delivery.json()["error"]["code"] == "invalid_github_delivery"
+
+
+def test_webhook_jobs_follow_global_posting_gate() -> None:
+    review_service = _FakeReviewService()
+
+    def service_factory(_settings: Settings) -> ServiceBundle:
+        return ServiceBundle(
+            github_client=_FakeGitHubClient(),  # type: ignore[arg-type]
+            codex_runner=_FakeCodexRunner(),  # type: ignore[arg-type]
+            review_service=review_service,  # type: ignore[arg-type]
+        )
+
+    application = create_app(
+        Settings(
+            _env_file=None,
+            github_token="test-token",
+            github_webhook_secret=_SECRET,
+            post_comments=True,
+        ),
+        service_factory=service_factory,
+    )
+    with TestClient(application) as client:
+        response = _signed_request(
+            client,
+            _payload(),
+            delivery="delivery-posting-enabled",
+        )
+
+    assert response.status_code == 202
+    assert review_service.calls
+    assert review_service.calls[0]["kwargs"]["post_comments"] is True
+    assert review_service.calls[0]["kwargs"]["expected_head_sha"] == "a" * 40

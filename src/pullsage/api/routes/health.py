@@ -101,9 +101,7 @@ async def ready(
     checks = ReadinessChecks(
         settings_loaded=True,
         worker_running=queue.is_running,
-        github_token_configured=_secret_is_configured(
-            setting_value(settings, "github_token")
-        ),
+        github_token_configured=_secret_is_configured(setting_value(settings, "github_token")),
         webhook_secret_configured=_secret_is_configured(
             setting_value(settings, "github_webhook_secret")
         ),

@@ -441,8 +441,6 @@ Duplicate deliveries use `status: "duplicate"` with `reason: "GitHub delivery wa
 | `202` | Accepted or safely ignored verified delivery |
 | `400` | Verified body is malformed or lacks required pull-request identifiers |
 | `401` | Signature header is missing or the signature is invalid |
-| `413` | Request exceeds an ingress/body limit, when configured |
-| `422` | Verified payload fields fail validation |
 | `503` | Webhook secret is unconfigured or worker queue is unavailable |
 
 ### cURL shape

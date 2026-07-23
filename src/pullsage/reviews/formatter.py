@@ -27,6 +27,7 @@ _SEVERITY_ORDER = (
     FindingSeverity.INFO,
 )
 _MAX_INLINE_BODY_CHARS = 6_000
+_MAX_REVIEW_BODY_CHARS = 60_000
 
 
 def _safe_markdown(value: str) -> str:
@@ -37,12 +38,7 @@ def _safe_markdown(value: str) -> str:
         for character in value.replace("\r\n", "\n").replace("\r", "\n")
         if character in {"\n", "\t"} or ord(character) >= 32
     )
-    return (
-        cleaned.strip()
-        .replace("@", "@\u200b")
-        .replace("<", "&lt;")
-        .replace(">", "&gt;")
-    )
+    return cleaned.strip().replace("@", "@\u200b").replace("<", "&lt;").replace(">", "&gt;")
 
 
 def _single_line(value: str) -> str:
@@ -54,7 +50,7 @@ def _location(finding: ReviewFinding) -> str:
     if finding.line is None:
         return path
     if finding.start_line is not None and finding.start_line != finding.line:
-        return f"{path}, lines {finding.start_line}–{finding.line}"
+        return f"{path}, lines {finding.start_line}-{finding.line}"
     return f"{path}, line {finding.line}"
 
 
@@ -74,10 +70,7 @@ def _finding_markdown(finding: ReviewFinding, index: int) -> list[str]:
         lines.extend(
             [
                 "",
-                (
-                    "   **Suggested fix:** "
-                    f"{_safe_markdown(finding.suggested_fix)}"
-                ),
+                (f"   **Suggested fix:** {_safe_markdown(finding.suggested_fix)}"),
             ]
         )
     return lines
@@ -86,7 +79,7 @@ def _finding_markdown(finding: ReviewFinding, index: int) -> list[str]:
 def format_review_markdown(review: ReviewResult) -> str:
     """Create a concise professional GitHub review body."""
 
-    lines = [
+    header = [
         "## PullSage review",
         "",
         f"- **Verdict:** `{review.verdict.value}`",
@@ -101,8 +94,9 @@ def format_review_markdown(review: ReviewResult) -> str:
         "",
     ]
 
+    finding_lines: list[str] = []
     if not review.findings:
-        lines.extend(
+        finding_lines.extend(
             [
                 "No reportable high-confidence findings.",
                 "",
@@ -116,43 +110,56 @@ def format_review_markdown(review: ReviewResult) -> str:
             findings = grouped.get(severity, [])
             if not findings:
                 continue
-            lines.extend([f"#### {severity.value.title()}", ""])
+            finding_lines.extend([f"#### {severity.value.title()}", ""])
             for index, finding in enumerate(findings, start=1):
-                lines.extend(_finding_markdown(finding, index))
-                lines.append("")
+                finding_lines.extend(_finding_markdown(finding, index))
+                finding_lines.append("")
 
+    tail: list[str] = []
     if review.testing_recommendations:
-        lines.extend(["### Testing recommendations", ""])
-        lines.extend(
+        tail.extend(["### Testing recommendations", ""])
+        tail.extend(
             f"- {_safe_markdown(recommendation)}"
             for recommendation in review.testing_recommendations
         )
-        lines.append("")
+        tail.append("")
 
     if review.limitations:
-        lines.extend(["### Limitations", ""])
-        lines.extend(
-            f"- {_safe_markdown(limitation)}"
-            for limitation in review.limitations
-        )
-        lines.append("")
+        tail.extend(["### Limitations", ""])
+        tail.extend(f"- {_safe_markdown(limitation)}" for limitation in review.limitations)
+        tail.append("")
 
-    lines.extend(
+    tail.extend(
         [
             "---",
             "_AI-assisted review by PullSage; a human reviewer should make the "
             "final merge decision._",
         ]
     )
-    return "\n".join(lines).strip()
+    body = "\n".join([*header, *finding_lines, *tail]).strip()
+    if len(body) <= _MAX_REVIEW_BODY_CHARS:
+        return body
+
+    truncation_notice = (
+        "_Additional finding detail was truncated to fit GitHub's review-body "
+        "limit. Valid inline comments are unaffected._"
+    )
+    prefix = "\n".join(header).rstrip()
+    suffix = "\n".join([truncation_notice, "", *tail]).strip()
+    available = max(
+        0,
+        _MAX_REVIEW_BODY_CHARS - len(prefix) - len(suffix) - 4,
+    )
+    bounded_findings = "\n".join(finding_lines)[:available]
+    last_newline = bounded_findings.rfind("\n")
+    if last_newline > 0:
+        bounded_findings = bounded_findings[:last_newline]
+    return (f"{prefix}\n\n{bounded_findings.rstrip()}\n\n{suffix}")[:_MAX_REVIEW_BODY_CHARS].strip()
 
 
 def _inline_body(finding: ReviewFinding) -> str:
     sections = [
-        (
-            f"**PullSage · {finding.severity.value.title()} · "
-            f"{finding.confidence:.0%} confidence**"
-        ),
+        (f"**PullSage · {finding.severity.value.title()} · {finding.confidence:.0%} confidence**"),
         "",
         f"**{_single_line(finding.title)}**",
         "",
@@ -164,10 +171,7 @@ def _inline_body(finding: ReviewFinding) -> str:
         sections.extend(
             [
                 "",
-                (
-                    "**Suggested fix:** "
-                    f"{_safe_markdown(finding.suggested_fix)}"
-                ),
+                (f"**Suggested fix:** {_safe_markdown(finding.suggested_fix)}"),
             ]
         )
     body = "\n".join(sections)
@@ -216,9 +220,7 @@ def build_inline_comments(
                 line=finding.line,
                 side=ReviewCommentSide.RIGHT,
                 start_line=start_line,
-                start_side=(
-                    ReviewCommentSide.RIGHT if start_line is not None else None
-                ),
+                start_side=(ReviewCommentSide.RIGHT if start_line is not None else None),
             )
         )
         if len(comments) >= max_comments:
@@ -238,4 +240,3 @@ def review_event_for_result(review: ReviewResult) -> ReviewEvent:
 
 # Public convenience alias.
 format_review = format_review_markdown
-

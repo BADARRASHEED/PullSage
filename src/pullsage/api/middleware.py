@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 from typing import Any
 from uuid import uuid4
@@ -12,10 +13,12 @@ from pullsage.logging_config import (
 )
 
 _VALID_REQUEST_ID = re.compile(r"^[A-Za-z0-9._:/-]{1,128}$")
+_MAX_REQUEST_BODY_BYTES = 1_048_576
+_BODY_METHODS = frozenset({"POST", "PUT", "PATCH"})
 
 
 class RequestIDMiddleware:
-    """Propagate a safe correlation ID for each HTTP request."""
+    """Propagate a correlation ID and bound mutating request bodies."""
 
     def __init__(self, app: Any) -> None:
         self.app = app
@@ -55,6 +58,67 @@ class RequestIDMiddleware:
             await send(message)
 
         try:
-            await self.app(scope, receive, send_with_request_id)
+            bounded_receive = receive
+            if scope.get("method", "").upper() in _BODY_METHODS:
+                messages: list[dict[str, Any]] = []
+                body_size = 0
+                too_large = False
+                while True:
+                    message = await receive()
+                    messages.append(message)
+                    if message["type"] == "http.disconnect":
+                        break
+                    if message["type"] != "http.request":
+                        continue
+                    body_size += len(message.get("body", b""))
+                    if body_size > _MAX_REQUEST_BODY_BYTES:
+                        too_large = True
+                        break
+                    if not message.get("more_body", False):
+                        break
+
+                if too_large:
+                    payload = json.dumps(
+                        {
+                            "error": {
+                                "code": "request_body_too_large",
+                                "message": "Request body exceeds the 1 MiB limit.",
+                                "request_id": request_id,
+                            }
+                        },
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                    await send_with_request_id(
+                        {
+                            "type": "http.response.start",
+                            "status": 413,
+                            "headers": [
+                                (b"content-type", b"application/json"),
+                                (b"content-length", str(len(payload)).encode("ascii")),
+                            ],
+                        }
+                    )
+                    await send_with_request_id(
+                        {
+                            "type": "http.response.body",
+                            "body": payload,
+                            "more_body": False,
+                        }
+                    )
+                    return
+
+                message_index = 0
+
+                async def replay_receive() -> dict[str, Any]:
+                    nonlocal message_index
+                    if message_index < len(messages):
+                        message = messages[message_index]
+                        message_index += 1
+                        return message
+                    return await receive()
+
+                bounded_receive = replay_receive
+
+            await self.app(scope, bounded_receive, send_with_request_id)
         finally:
             reset_request_id(token)

@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
 
 from pullsage.config import Settings
-from pullsage.mcp.server import PullSageMCPTools
+from pullsage.mcp.server import PullSageMCPTools, create_mcp_server
 from pullsage.reviews.models import ReviewResult
 
 
@@ -40,6 +42,7 @@ def _tools(
     allow_writes: bool,
 ) -> tuple[PullSageMCPTools, AsyncMock, AsyncMock]:
     github_client = AsyncMock()
+    github_client.get_pull_request.return_value = SimpleNamespace(head_sha="abc1234")
     review_service = AsyncMock()
     adapter = PullSageMCPTools(
         Settings(allow_mcp_write_tools=allow_writes, _env_file=None),
@@ -92,6 +95,7 @@ async def test_dry_run_review_returns_validated_result() -> None:
         "example",
         7,
         post_comments=False,
+        expected_head_sha=None,
     )
 
 
@@ -104,6 +108,7 @@ async def test_enabled_post_still_requires_structured_review_payload() -> None:
         "example",
         7,
         {"summary": "arbitrary text"},
+        head_sha="abc1234",
     )
 
     assert response["ok"] is False
@@ -116,10 +121,68 @@ async def test_enabled_post_uses_shared_review_service() -> None:
     adapter, _github, review_service = _tools(allow_writes=True)
     review_service.post_review.return_value = _Dumpable({"id": 123, "state": "COMMENTED"})
 
-    response = await adapter.post_review("octo", "example", 7, _review())
+    response = await adapter.post_review(
+        "octo",
+        "example",
+        7,
+        _review(),
+        head_sha="abc1234",
+    )
 
     assert response == {
         "ok": True,
         "posted_review": {"id": 123, "state": "COMMENTED"},
     }
+    review_service.post_review.assert_awaited_once_with(
+        "octo",
+        "example",
+        7,
+        _review(),
+        expected_head_sha="abc1234",
+    )
+
+
+@pytest.mark.asyncio
+async def test_duplicate_mcp_post_is_suppressed_for_same_head() -> None:
+    adapter, _github, review_service = _tools(allow_writes=True)
+    review_service.post_review.return_value = _Dumpable({"id": 123, "state": "COMMENTED"})
+
+    first = await adapter.post_review(
+        "octo",
+        "example",
+        7,
+        _review(),
+        head_sha="abc1234",
+    )
+    duplicate = await adapter.post_review(
+        "octo",
+        "example",
+        7,
+        _review(),
+        head_sha="abc1234",
+    )
+
+    assert first["ok"] is True
+    assert duplicate["ok"] is False
+    assert duplicate["error"]["code"] == "duplicate_review_post"
     review_service.post_review.assert_awaited_once()
+
+
+def test_server_registers_only_the_five_bounded_tools() -> None:
+    adapter, _github, _review_service = _tools(allow_writes=False)
+    server = create_mcp_server(adapter.settings, tools=adapter)
+
+    tools = asyncio.run(server.list_tools())
+    names = {tool.name for tool in tools}
+
+    assert names == {
+        "pullsage_get_pull_request",
+        "pullsage_get_changed_files",
+        "pullsage_get_pull_request_diff",
+        "pullsage_review_pull_request",
+        "pullsage_post_review",
+    }
+    post_tool = next(tool for tool in tools if tool.name == "pullsage_post_review")
+    assert "review" in post_tool.inputSchema["properties"]
+    assert "head_sha" in post_tool.inputSchema["properties"]
+    assert all("merge" not in name and "shell" not in name for name in names)

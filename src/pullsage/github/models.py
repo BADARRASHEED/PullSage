@@ -5,7 +5,6 @@ from __future__ import annotations
 from collections.abc import Mapping
 from datetime import datetime
 from enum import StrEnum
-from pathlib import PurePosixPath
 from typing import Annotated, Any, Self
 
 from pydantic import (
@@ -13,7 +12,6 @@ from pydantic import (
     ConfigDict,
     Field,
     StrictBool,
-    StrictInt,
     StrictStr,
     StringConstraints,
     field_validator,
@@ -33,8 +31,7 @@ def validate_repository_path(value: str) -> str:
 
     if "\\" in value or "\x00" in value or value.startswith("/"):
         raise ValueError("file_path must be a repository-relative POSIX path")
-    path = PurePosixPath(value)
-    if value in {".", ".."} or any(part in {"", ".", ".."} for part in path.parts):
+    if any(part in {"", ".", ".."} for part in value.split("/")):
         raise ValueError("file_path contains an unsafe path segment")
     return value
 
@@ -45,7 +42,7 @@ class GitHubModel(BaseModel):
     model_config = ConfigDict(
         extra="forbid",
         frozen=True,
-        str_strip_whitespace=True,
+        str_strip_whitespace=False,
         validate_default=True,
     )
 
@@ -184,9 +181,7 @@ class GitHubReviewComment(GitHubModel):
         }
         if self.start_line is not None:
             payload["start_line"] = self.start_line
-            payload["start_side"] = (
-                self.start_side or ReviewCommentSide.RIGHT
-            ).value
+            payload["start_side"] = (self.start_side or ReviewCommentSide.RIGHT).value
         return payload
 
 
@@ -229,12 +224,9 @@ class PullRequestWebhook(GitHubModel):
                 head_sha=pull_request["head"]["sha"],
             )
         except (KeyError, TypeError) as exc:
-            raise ValueError(
-                "GitHub pull_request payload is missing required fields"
-            ) from exc
+            raise ValueError("GitHub pull_request payload is missing required fields") from exc
 
 
 # Public compatibility names that describe the endpoint payload explicitly.
 PullRequestMetadata = PullRequest
 PullRequestFile = ChangedFile
-

@@ -6,7 +6,7 @@ import asyncio
 from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
-from pullsage.exceptions import JobNotFoundError
+from pullsage.exceptions import JobNotFoundError, ReviewCapacityError
 from pullsage.jobs.models import (
     TERMINAL_JOB_STATUSES,
     JobSource,
@@ -22,9 +22,7 @@ class InvalidJobTransitionError(ValueError):
 
 _ALLOWED_TRANSITIONS: dict[JobStatus, frozenset[JobStatus]] = {
     JobStatus.QUEUED: frozenset({JobStatus.FETCHING_CONTEXT, JobStatus.FAILED}),
-    JobStatus.FETCHING_CONTEXT: frozenset(
-        {JobStatus.REVIEWING, JobStatus.FAILED}
-    ),
+    JobStatus.FETCHING_CONTEXT: frozenset({JobStatus.REVIEWING, JobStatus.FAILED}),
     JobStatus.REVIEWING: frozenset(
         {
             JobStatus.VALIDATING,
@@ -33,9 +31,7 @@ _ALLOWED_TRANSITIONS: dict[JobStatus, frozenset[JobStatus]] = {
             JobStatus.FAILED,
         }
     ),
-    JobStatus.VALIDATING: frozenset(
-        {JobStatus.POSTING, JobStatus.COMPLETED, JobStatus.FAILED}
-    ),
+    JobStatus.VALIDATING: frozenset({JobStatus.POSTING, JobStatus.COMPLETED, JobStatus.FAILED}),
     JobStatus.POSTING: frozenset({JobStatus.COMPLETED, JobStatus.FAILED}),
     JobStatus.COMPLETED: frozenset(),
     JobStatus.FAILED: frozenset(),
@@ -59,10 +55,18 @@ class InMemoryJobStore:
     retention period.
     """
 
-    def __init__(self, retention_seconds: float = 3600) -> None:
+    def __init__(
+        self,
+        retention_seconds: float = 3600,
+        *,
+        max_jobs: int = 10_000,
+    ) -> None:
         if retention_seconds < 0:
             raise ValueError("retention_seconds must be non-negative")
+        if max_jobs < 1:
+            raise ValueError("max_jobs must be at least 1")
         self._retention_seconds = float(retention_seconds)
+        self._max_jobs = max_jobs
         self._jobs: dict[UUID, ReviewJob] = {}
         self._active_by_key: dict[tuple[str, str, int, str], UUID] = {}
         self._lock = asyncio.Lock()
@@ -70,6 +74,10 @@ class InMemoryJobStore:
     @property
     def retention_seconds(self) -> float:
         return self._retention_seconds
+
+    @property
+    def max_jobs(self) -> int:
+        return self._max_jobs
 
     def __len__(self) -> int:
         """Return the current retained-job count."""
@@ -92,7 +100,7 @@ class InMemoryJobStore:
             owner=owner,
             repository=repository,
             pull_request_number=pull_request_number,
-            source=source,
+            source=JobSource(source),
             post_comments=post_comments,
             head_sha=head_sha,
         )
@@ -105,6 +113,7 @@ class InMemoryJobStore:
                     return existing.model_copy(deep=True), False
                 self._active_by_key.pop(key, None)
 
+            self._ensure_capacity()
             self._jobs[candidate.job_id] = candidate
             if key is not None:
                 self._active_by_key[key] = candidate.job_id
@@ -146,11 +155,32 @@ class InMemoryJobStore:
                 if existing is not None and not existing.is_terminal:
                     return existing.model_copy(deep=True)
 
+            self._ensure_capacity()
             stored = job.model_copy(deep=True)
             self._jobs[stored.job_id] = stored
             if key is not None and not stored.is_terminal:
                 self._active_by_key[key] = stored.job_id
             return stored.model_copy(deep=True)
+
+    def _ensure_capacity(self) -> None:
+        """Evict the oldest terminal job or reject unbounded active growth."""
+
+        if len(self._jobs) < self._max_jobs:
+            return
+        terminal_jobs = [
+            job for job in self._jobs.values() if job.is_terminal and job.completed_at is not None
+        ]
+        if terminal_jobs:
+            oldest = min(
+                terminal_jobs,
+                key=lambda job: (job.completed_at, job.created_at),
+            )
+            self._jobs.pop(oldest.job_id, None)
+            key = oldest.deduplication_key
+            if key is not None and self._active_by_key.get(key) == oldest.job_id:
+                self._active_by_key.pop(key, None)
+            return
+        raise ReviewCapacityError()
 
     async def get(self, job_id: UUID | str) -> ReviewJob | None:
         """Return a defensive copy of a job, or ``None`` if it is absent."""
@@ -198,8 +228,7 @@ class InMemoryJobStore:
                 allowed = _ALLOWED_TRANSITIONS[job.status]
                 if next_status not in allowed:
                     raise InvalidJobTransitionError(
-                        f"Cannot move job from {job.status.value} "
-                        f"to {next_status.value}"
+                        f"Cannot move job from {job.status.value} to {next_status.value}"
                     )
 
             if next_status not in {JobStatus.QUEUED, JobStatus.FAILED}:
@@ -269,9 +298,7 @@ class InMemoryJobStore:
         """Remove terminal jobs older than the retention window."""
 
         effective_retention = (
-            self._retention_seconds
-            if retention_seconds is None
-            else float(retention_seconds)
+            self._retention_seconds if retention_seconds is None else float(retention_seconds)
         )
         if effective_retention < 0:
             raise ValueError("retention_seconds must be non-negative")
@@ -284,9 +311,7 @@ class InMemoryJobStore:
             expired_ids = [
                 job_id
                 for job_id, job in self._jobs.items()
-                if job.is_terminal
-                and job.completed_at is not None
-                and job.completed_at <= cutoff
+                if job.is_terminal and job.completed_at is not None and job.completed_at <= cutoff
             ]
             for job_id in expired_ids:
                 job = self._jobs.pop(job_id)
@@ -303,13 +328,14 @@ class InMemoryJobStore:
         if kwargs:
             unexpected = ", ".join(sorted(kwargs))
             raise TypeError(f"Unexpected cleanup arguments: {unexpected}")
+        if retention_seconds is not None and (
+            isinstance(retention_seconds, bool)
+            or not isinstance(retention_seconds, int | float)
+        ):
+            raise TypeError("retention_seconds must be a number or None")
         return await self.cleanup_expired(
             now=now if isinstance(now, datetime) or now is None else None,
-            retention_seconds=(
-                float(retention_seconds)
-                if retention_seconds is not None
-                else None
-            ),
+            retention_seconds=(float(retention_seconds) if retention_seconds is not None else None),
         )
 
     async def delete(self, job_id: UUID | str) -> bool:

@@ -1,5 +1,6 @@
 """Ephemeral in-memory review job primitives."""
 
+from pullsage.exceptions import JobNotFoundError
 from pullsage.jobs.models import (
     JobSource,
     JobStatus,
@@ -9,7 +10,6 @@ from pullsage.jobs.models import (
 from pullsage.jobs.store import (
     InMemoryJobStore,
     InvalidJobTransitionError,
-    JobNotFoundError,
 )
 from pullsage.jobs.worker import ReviewQueue
 

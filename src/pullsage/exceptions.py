@@ -31,11 +31,7 @@ class PullSageError(Exception):
         status_code: int | None = None,
         **details: Any,
     ) -> None:
-        resolved_safe_message = (
-            safe_message
-            or message
-            or self.default_safe_message
-        )
+        resolved_safe_message = safe_message or message or self.default_safe_message
         internal_message = message or resolved_safe_message
         super().__init__(internal_message)
         self.safe_message = resolved_safe_message
@@ -245,6 +241,30 @@ class PullRequestTooLargeError(GitHubError):
         self.limit = limit
 
 
+class StalePullRequestHeadError(PullSageError):
+    """The pull request changed while a review was being prepared."""
+
+    default_code = "stale_pull_request_head"
+    default_status_code = 409
+    default_safe_message = (
+        "The pull request changed during review; queue a review for the latest head."
+    )
+
+    def __init__(
+        self,
+        *,
+        expected_head_sha: str,
+        actual_head_sha: str,
+    ) -> None:
+        super().__init__(
+            self.default_safe_message,
+            expected_head_sha=expected_head_sha,
+            actual_head_sha=actual_head_sha,
+        )
+        self.expected_head_sha = expected_head_sha
+        self.actual_head_sha = actual_head_sha
+
+
 class TooManyChangedFilesError(PullRequestTooLargeError):
     """The pull request contains more changed files than configured."""
 
@@ -304,9 +324,7 @@ class CodexRuntimeError(CodexError):
     """Codex exited unsuccessfully or could not be started."""
 
     default_code = "codex_runtime_error"
-    default_safe_message = (
-        "Codex could not run the review. Confirm that the CLI is authenticated."
-    )
+    default_safe_message = "Codex could not run the review. Confirm that the CLI is authenticated."
 
     def __init__(
         self,
@@ -416,10 +434,17 @@ class DuplicateReviewJobError(PullSageError):
         self.head_sha = head_sha
 
 
+class ReviewCapacityError(PullSageError):
+    """The bounded in-memory review runtime cannot accept another job."""
+
+    default_code = "review_capacity_exceeded"
+    default_status_code = 429
+    default_safe_message = "PullSage review capacity is temporarily full; retry later."
+
+
 class WorkerShutdownError(PullSageError):
     """The review worker is shutting down and cannot accept work."""
 
     default_code = "worker_shutdown"
     default_status_code = 503
     default_safe_message = "The review worker is shutting down."
-

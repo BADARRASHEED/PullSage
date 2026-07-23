@@ -30,8 +30,5 @@ def format_validation_error(error: Exception) -> str:
         details = error.errors(include_url=False, include_context=False, include_input=False)
         return json.dumps(details, ensure_ascii=False, default=str)[:8_000]
     if isinstance(error, json.JSONDecodeError):
-        return (
-            f"Invalid JSON at line {error.lineno}, column {error.colno}: "
-            f"{error.msg}"
-        )
+        return f"Invalid JSON at line {error.lineno}, column {error.colno}: {error.msg}"
     return f"{type(error).__name__}: output did not match the review schema"

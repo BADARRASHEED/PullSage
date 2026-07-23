@@ -155,11 +155,7 @@ class Settings(BaseSettings):
     def webhook_secret_value(self) -> str | None:
         """Return the webhook secret only at the verification boundary."""
 
-        return (
-            self.github_webhook_secret.get_secret_value()
-            if self.github_webhook_secret
-            else None
-        )
+        return self.github_webhook_secret.get_secret_value() if self.github_webhook_secret else None
 
 
 @lru_cache(maxsize=1)

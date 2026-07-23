@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import inspect
 import json
+import re
 from typing import Any, Literal
 from uuid import UUID
 
@@ -27,6 +27,9 @@ from pullsage.jobs.models import JobSource
 from pullsage.jobs.worker import ReviewQueue
 
 router = APIRouter(prefix="/webhooks", tags=["webhooks"])
+
+_MAX_WEBHOOK_BODY_BYTES = 1_048_576
+_DELIVERY_ID_PATTERN = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 
 
 class _WebhookOwner(BaseModel):
@@ -86,10 +89,38 @@ async def _check_and_store_delivery(
     cache: DeliveryCache,
     delivery_id: str,
 ) -> bool:
-    accepted = cache.check_and_store(delivery_id)
-    if inspect.isawaitable(accepted):
-        accepted = await accepted
-    return bool(accepted)
+    return cache.check_and_store(delivery_id)
+
+
+async def _read_bounded_body(request: Request) -> bytes:
+    """Read a webhook body without allowing unbounded in-memory growth."""
+
+    content_length = request.headers.get("content-length")
+    if content_length:
+        try:
+            if int(content_length) > _MAX_WEBHOOK_BODY_BYTES:
+                raise HTTPException(
+                    status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                    detail={
+                        "code": "webhook_body_too_large",
+                        "message": "Webhook payload exceeds the allowed size",
+                    },
+                )
+        except ValueError:
+            pass
+
+    body = bytearray()
+    async for chunk in request.stream():
+        body.extend(chunk)
+        if len(body) > _MAX_WEBHOOK_BODY_BYTES:
+            raise HTTPException(
+                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                detail={
+                    "code": "webhook_body_too_large",
+                    "message": "Webhook payload exceeds the allowed size",
+                },
+            )
+    return bytes(body)
 
 
 @router.post(
@@ -109,10 +140,8 @@ async def github_webhook(
 ) -> WebhookResponse:
     """Verify the raw body before parsing, then deduplicate and enqueue."""
 
-    body = await request.body()
-    secret = _secret_value(
-        setting_value(settings, "github_webhook_secret", default=None)
-    )
+    body = await _read_bounded_body(request)
+    secret = _secret_value(setting_value(settings, "github_webhook_secret", default=None))
     if not secret:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -131,7 +160,7 @@ async def github_webhook(
         )
 
     try:
-        verified = verify_webhook_signature(
+        verify_webhook_signature(
             body,
             x_hub_signature_256,
             secret,
@@ -146,14 +175,6 @@ async def github_webhook(
                 "message": "Webhook signature is missing or invalid",
             },
         ) from exc
-    if verified is False:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail={
-                "code": "invalid_webhook_signature",
-                "message": "Webhook signature is missing or invalid",
-            },
-        )
     if not x_github_event:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -168,6 +189,14 @@ async def github_webhook(
             detail={
                 "code": "missing_github_delivery",
                 "message": "X-GitHub-Delivery is required",
+            },
+        )
+    if not _DELIVERY_ID_PATTERN.fullmatch(x_github_delivery):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "code": "invalid_github_delivery",
+                "message": "X-GitHub-Delivery is invalid",
             },
         )
     if x_github_event != "pull_request":

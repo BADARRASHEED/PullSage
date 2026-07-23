@@ -60,9 +60,7 @@ def create_app(
         application.state.review_service = bundle.review_service
         application.state.job_store = job_store
         application.state.review_queue = review_queue
-        application.state.delivery_cache = build_delivery_cache(
-            runtime_settings
-        )
+        application.state.delivery_cache = build_delivery_cache(runtime_settings)
 
         await review_queue.start()
         logger.info(

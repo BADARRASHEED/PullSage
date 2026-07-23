@@ -36,6 +36,7 @@ DEFAULT_GITHUB_API_VERSION = "2022-11-28"
 DEFAULT_TIMEOUT_SECONDS = 30.0
 DEFAULT_MAX_CHANGED_FILES = 100
 DEFAULT_MAX_DIFF_CHARS = 200_000
+DEFAULT_MAX_RESPONSE_BYTES = 2_097_152
 DEFAULT_USER_AGENT = "PullSage/0.1"
 GITHUB_JSON_MEDIA_TYPE = "application/vnd.github+json"
 GITHUB_DIFF_MEDIA_TYPE = "application/vnd.github.diff"
@@ -78,9 +79,7 @@ class GitHubClient:
     ) -> None:
         if token is not None and not isinstance(token, str):
             settings = token
-            token = _secret_value(
-                _setting(settings, ("github_token", "GITHUB_TOKEN"), None)
-            )
+            token = _secret_value(_setting(settings, ("github_token", "GITHUB_TOKEN"), None))
             api_url = api_url or _setting(
                 settings,
                 ("github_api_url", "GITHUB_API_URL"),
@@ -207,10 +206,14 @@ class GitHubClient:
         accept: str = GITHUB_JSON_MEDIA_TYPE,
         params: Mapping[str, str | int] | None = None,
         json_payload: Mapping[str, Any] | None = None,
+        max_response_bytes: int = DEFAULT_MAX_RESPONSE_BYTES,
+        truncate_response: bool = False,
     ) -> httpx.Response:
+        if max_response_bytes <= 0:
+            raise ValueError("max_response_bytes must be positive")
         url = f"{self.api_url}{path}"
         try:
-            response = await self._client.request(
+            request = self._client.build_request(
                 method,
                 url,
                 headers=self._headers(accept),
@@ -218,6 +221,22 @@ class GitHubClient:
                 json=json_payload,
                 timeout=self.timeout,
             )
+            streamed_response = await self._client.send(request, stream=True)
+            try:
+                content, response_truncated = await self._read_response_bounded(
+                    streamed_response,
+                    max_response_bytes=max_response_bytes,
+                    truncate=truncate_response,
+                )
+                response = httpx.Response(
+                    streamed_response.status_code,
+                    headers=streamed_response.headers,
+                    content=content,
+                    request=streamed_response.request,
+                )
+                response.extensions["pullsage_body_truncated"] = response_truncated
+            finally:
+                await streamed_response.aclose()
         except httpx.TimeoutException as exc:
             raise GitHubAPIError(
                 "GitHub API request timed out.",
@@ -234,13 +253,41 @@ class GitHubClient:
         return response
 
     @staticmethod
+    async def _read_response_bounded(
+        response: httpx.Response,
+        *,
+        max_response_bytes: int,
+        truncate: bool,
+    ) -> tuple[bytes, bool]:
+        """Read a decoded HTTP body without permitting unbounded allocation."""
+
+        content = bytearray()
+        async for chunk in response.aiter_bytes():
+            remaining = max_response_bytes - len(content)
+            if len(chunk) <= remaining:
+                content.extend(chunk)
+                continue
+            if not truncate:
+                raise PullRequestTooLargeError(
+                    resource="GitHub API response",
+                    actual=len(content) + len(chunk),
+                    limit=max_response_bytes,
+                )
+            if remaining > 0:
+                content.extend(chunk[:remaining])
+            return bytes(content), True
+        return bytes(content), False
+
+    @staticmethod
     def _response_message(response: httpx.Response) -> str:
         try:
             payload = response.json()
         except ValueError:
             return ""
-        if isinstance(payload, Mapping) and isinstance(payload.get("message"), str):
-            return payload["message"].casefold()
+        if isinstance(payload, Mapping):
+            message = payload.get("message")
+            if isinstance(message, str):
+                return message.casefold()
         return ""
 
     @staticmethod
@@ -264,11 +311,7 @@ class GitHubClient:
         request_id = response.headers.get("X-GitHub-Request-Id")
         message = self._response_message(response)
         remaining = response.headers.get("X-RateLimit-Remaining")
-        if (
-            status == 429
-            or remaining == "0"
-            or (status == 403 and "rate limit" in message)
-        ):
+        if status == 429 or remaining == "0" or (status == 403 and "rate limit" in message):
             raise GitHubRateLimitError(
                 self._retry_after(response),
                 upstream_status_code=status,
@@ -485,9 +528,18 @@ class GitHubClient:
             "GET",
             path,
             accept=GITHUB_DIFF_MEDIA_TYPE,
+            max_response_bytes=(limit + 1) * 4,
+            truncate_response=True,
         )
-        content = response.text
-        original_length = len(content)
+        content = response.content.decode("utf-8", errors="replace")
+        response_truncated = bool(
+            response.extensions.get("pullsage_body_truncated", False)
+        )
+        original_length = (
+            max(len(content) + 1, limit + 1)
+            if response_truncated
+            else len(content)
+        )
         if original_length <= limit:
             return PullRequestDiff(
                 content=content,
@@ -521,9 +573,7 @@ class GitHubClient:
                 state=payload["state"],
                 html_url=payload.get("html_url"),
                 body=payload.get("body"),
-                submitted_at=GitHubClient._parse_datetime(
-                    payload.get("submitted_at")
-                ),
+                submitted_at=GitHubClient._parse_datetime(payload.get("submitted_at")),
             )
         except (KeyError, TypeError, ValueError, ValidationError) as exc:
             raise GitHubAPIError(
@@ -539,9 +589,8 @@ class GitHubClient:
         *,
         body: str,
         event: ReviewEvent | str = ReviewEvent.COMMENT,
-        comments: Sequence[
-            GitHubReviewComment | Mapping[str, Any]
-        ] = (),
+        comments: Sequence[GitHubReviewComment | Mapping[str, Any]] = (),
+        commit_id: str | None = None,
     ) -> PostedReview:
         """Create one review containing a summary and valid inline comments."""
 
@@ -549,9 +598,7 @@ class GitHubClient:
         if not isinstance(body, str) or not body.strip():
             raise ValueError("review body must be non-empty")
         try:
-            resolved_event = (
-                event if isinstance(event, ReviewEvent) else ReviewEvent(event)
-            )
+            resolved_event = event if isinstance(event, ReviewEvent) else ReviewEvent(event)
             resolved_comments = [
                 item
                 if isinstance(item, GitHubReviewComment)
@@ -570,10 +617,16 @@ class GitHubClient:
             "body": body.strip(),
             "event": resolved_event.value,
         }
+        if commit_id is not None:
+            if (
+                not isinstance(commit_id, str)
+                or not commit_id.strip()
+                or len(commit_id.strip()) > 128
+            ):
+                raise ValueError("commit_id must be a non-empty commit SHA")
+            payload["commit_id"] = commit_id.strip()
         if resolved_comments:
-            payload["comments"] = [
-                comment.to_api_payload() for comment in resolved_comments
-            ]
+            payload["comments"] = [comment.to_api_payload() for comment in resolved_comments]
         response = await self._request(
             "POST",
             path,
@@ -589,9 +642,8 @@ class GitHubClient:
         *,
         body: str,
         event: ReviewEvent | str = ReviewEvent.COMMENT,
-        comments: Sequence[
-            GitHubReviewComment | Mapping[str, Any]
-        ] = (),
+        comments: Sequence[GitHubReviewComment | Mapping[str, Any]] = (),
+        commit_id: str | None = None,
     ) -> PostedReview:
         """Compatibility alias for :meth:`post_pull_request_review`."""
 
@@ -602,9 +654,9 @@ class GitHubClient:
             body=body,
             event=event,
             comments=comments,
+            commit_id=commit_id,
         )
 
     # Read aliases make tool wiring explicit without duplicating behavior.
     get_pull_request_files = get_changed_files
     get_diff = get_pull_request_diff
-

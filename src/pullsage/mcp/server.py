@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
+import time
+from collections import OrderedDict
 from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from typing import Annotated, Any
@@ -13,13 +16,16 @@ from pydantic import Field, ValidationError
 
 from pullsage.ai.codex_runner import CodexRunner
 from pullsage.config import Settings, get_settings
-from pullsage.exceptions import PullSageError
+from pullsage.exceptions import PullSageError, StalePullRequestHeadError
 from pullsage.github.client import GitHubClient
 from pullsage.logging_config import configure_logging
 from pullsage.reviews.models import ReviewResult
 from pullsage.reviews.service import ReviewService
 
 logger = logging.getLogger(__name__)
+
+_POST_IDEMPOTENCY_TTL_SECONDS = 3_600
+_MAX_POST_IDEMPOTENCY_ENTRIES = 1_000
 
 RepositoryPart = Annotated[
     str,
@@ -33,6 +39,15 @@ RepositoryPart = Annotated[
 PullRequestNumber = Annotated[
     int,
     Field(ge=1, description="Positive GitHub pull-request number"),
+]
+HeadSha = Annotated[
+    str,
+    Field(
+        min_length=7,
+        max_length=128,
+        pattern=r"^[A-Fa-f0-9]+$",
+        description="Head commit SHA against which the review was produced",
+    ),
 ]
 
 SERVER_INSTRUCTIONS = """
@@ -64,6 +79,12 @@ class PullSageMCPTools:
             settings,
             self.github_client,
             self.codex_runner,
+        )
+        self._post_cache: OrderedDict[str, float] = OrderedDict()
+        self._posts_in_flight: set[str] = set()
+        self._post_cache_lock = asyncio.Lock()
+        self._review_semaphore = asyncio.Semaphore(
+            max(1, int(settings.max_concurrent_reviews))
         )
 
     async def aclose(self) -> None:
@@ -105,9 +126,11 @@ class PullSageMCPTools:
                 repository,
                 pull_request_number,
             )
+            bounded_files, patches_truncated = self.review_service.bound_changed_file_patches(files)
             return self._success(
-                changed_files=[item.model_dump(mode="json") for item in files],
-                count=len(files),
+                changed_files=[item.model_dump(mode="json") for item in bounded_files],
+                count=len(bounded_files),
+                patches_truncated=patches_truncated,
             )
         except PullSageError as error:
             return self._expected_error(error, owner, repository, pull_request_number)
@@ -149,15 +172,39 @@ class PullSageMCPTools:
         if post_comments and not self.settings.allow_mcp_write_tools:
             return self._write_disabled()
         try:
-            review = await self.review_service.review_pull_request(
-                owner,
-                repository,
-                pull_request_number,
-                post_comments=post_comments,
-            )
+            expected_head_sha: str | None = None
+            if post_comments:
+                pull_request = await self.github_client.get_pull_request(
+                    owner,
+                    repository,
+                    pull_request_number,
+                )
+                expected_head_sha = pull_request.head_sha
+            async with self._review_semaphore:
+                review = await self.review_service.review_pull_request(
+                    owner,
+                    repository,
+                    pull_request_number,
+                    post_comments=False,
+                    expected_head_sha=expected_head_sha,
+                )
+            posted_review: dict[str, Any] | None = None
+            if post_comments:
+                assert expected_head_sha is not None
+                post_response = await self._post_validated_review(
+                    owner,
+                    repository,
+                    pull_request_number,
+                    review,
+                    expected_head_sha=expected_head_sha,
+                )
+                if not post_response["ok"]:
+                    return post_response
+                posted_review = post_response["posted_review"]
             return self._success(
                 review=review.model_dump(mode="json"),
                 posted=post_comments,
+                **({"posted_review": posted_review} if posted_review is not None else {}),
             )
         except PullSageError as error:
             return self._expected_error(error, owner, repository, pull_request_number)
@@ -170,28 +217,50 @@ class PullSageMCPTools:
         repository: str,
         pull_request_number: int,
         review: ReviewResult | Mapping[str, Any],
+        *,
+        head_sha: str | None = None,
     ) -> dict[str, Any]:
         """Post one schema-validated review when the MCP write gate is enabled."""
 
         if not self.settings.allow_mcp_write_tools:
             return self._write_disabled()
+        if not head_sha:
+            return {
+                "ok": False,
+                "error": {
+                    "code": "review_head_sha_required",
+                    "message": (
+                        "The reviewed head_sha is required for direct posting. "
+                        "Fetch the current pull request and review that exact head first."
+                    ),
+                },
+            }
         try:
             validated_review = ReviewResult.model_validate(review)
-            posted = await self.review_service.post_review(
+            pull_request = await self.github_client.get_pull_request(
+                owner,
+                repository,
+                pull_request_number,
+            )
+            if pull_request.head_sha.casefold() != head_sha.casefold():
+                raise StalePullRequestHeadError(
+                    expected_head_sha=head_sha,
+                    actual_head_sha=pull_request.head_sha,
+                )
+            return await self._post_validated_review(
                 owner,
                 repository,
                 pull_request_number,
                 validated_review,
+                expected_head_sha=head_sha,
             )
-            return self._success(posted_review=posted.model_dump(mode="json"))
         except ValidationError:
             return {
                 "ok": False,
                 "error": {
                     "code": "invalid_review_payload",
                     "message": (
-                        "The review payload does not satisfy PullSage's structured "
-                        "review schema."
+                        "The review payload does not satisfy PullSage's structured review schema."
                     ),
                 },
             }
@@ -199,6 +268,93 @@ class PullSageMCPTools:
             return self._expected_error(error, owner, repository, pull_request_number)
         except Exception:
             return self._unexpected_error(owner, repository, pull_request_number)
+
+    async def _post_validated_review(
+        self,
+        owner: str,
+        repository: str,
+        pull_request_number: int,
+        review: ReviewResult,
+        *,
+        expected_head_sha: str,
+    ) -> dict[str, Any]:
+        key = self._post_key(
+            owner,
+            repository,
+            pull_request_number,
+            expected_head_sha,
+        )
+        if not await self._claim_post(key):
+            return {
+                "ok": False,
+                "error": {
+                    "code": "duplicate_review_post",
+                    "message": (
+                        "An identical review for this pull-request head was "
+                        "already posted or is currently posting."
+                    ),
+                },
+            }
+        succeeded = False
+        try:
+            posted = await self.review_service.post_review(
+                owner,
+                repository,
+                pull_request_number,
+                review,
+                expected_head_sha=expected_head_sha,
+            )
+            succeeded = True
+            return self._success(posted_review=posted.model_dump(mode="json"))
+        except PullSageError as error:
+            return self._expected_error(
+                error,
+                owner,
+                repository,
+                pull_request_number,
+            )
+        except Exception:
+            return self._unexpected_error(
+                owner,
+                repository,
+                pull_request_number,
+            )
+        finally:
+            await self._finish_post(key, succeeded=succeeded)
+
+    @staticmethod
+    def _post_key(
+        owner: str,
+        repository: str,
+        pull_request_number: int,
+        expected_head_sha: str,
+    ) -> str:
+        return (
+            f"{owner.casefold()}/{repository.casefold()}:"
+            f"{pull_request_number}:{expected_head_sha.casefold()}"
+        )
+
+    async def _claim_post(self, key: str) -> bool:
+        now = time.monotonic()
+        async with self._post_cache_lock:
+            while self._post_cache:
+                _, expiry = next(iter(self._post_cache.items()))
+                if expiry > now:
+                    break
+                self._post_cache.popitem(last=False)
+            if key in self._post_cache or key in self._posts_in_flight:
+                return False
+            self._posts_in_flight.add(key)
+            return True
+
+    async def _finish_post(self, key: str, *, succeeded: bool) -> None:
+        async with self._post_cache_lock:
+            self._posts_in_flight.discard(key)
+            if not succeeded:
+                return
+            while len(self._post_cache) >= _MAX_POST_IDEMPOTENCY_ENTRIES:
+                self._post_cache.popitem(last=False)
+            self._post_cache[key] = time.monotonic() + _POST_IDEMPOTENCY_TTL_SECONDS
 
     @staticmethod
     def _success(**payload: Any) -> dict[str, Any]:
@@ -360,6 +516,7 @@ def create_mcp_server(
         owner: RepositoryPart,
         repository: RepositoryPart,
         pull_request_number: PullRequestNumber,
+        head_sha: HeadSha,
         review: ReviewResult,
     ) -> dict[str, Any]:
         """Post one validated review; fails unless MCP write tools are enabled."""
@@ -369,6 +526,7 @@ def create_mcp_server(
             repository,
             pull_request_number,
             review,
+            head_sha=head_sha,
         )
 
     return server

@@ -22,10 +22,81 @@ NonEmptyString = Annotated[
     str,
     StringConstraints(strict=True, strip_whitespace=True, min_length=1),
 ]
+SummaryText = Annotated[
+    str,
+    StringConstraints(
+        strict=True,
+        strip_whitespace=True,
+        min_length=1,
+        max_length=4_000,
+    ),
+]
+FindingIdentifier = Annotated[
+    str,
+    StringConstraints(
+        strict=True,
+        strip_whitespace=True,
+        min_length=1,
+        max_length=200,
+    ),
+]
+FindingTitle = Annotated[
+    str,
+    StringConstraints(
+        strict=True,
+        strip_whitespace=True,
+        min_length=1,
+        max_length=200,
+    ),
+]
+FindingBody = Annotated[
+    str,
+    StringConstraints(
+        strict=True,
+        strip_whitespace=True,
+        min_length=1,
+        max_length=3_000,
+    ),
+]
+FindingEvidence = Annotated[
+    str,
+    StringConstraints(
+        strict=True,
+        strip_whitespace=True,
+        min_length=1,
+        max_length=1_500,
+    ),
+]
+FilePath = Annotated[
+    str,
+    StringConstraints(
+        strict=True,
+        strip_whitespace=True,
+        min_length=1,
+        max_length=1_024,
+    ),
+]
+SuggestedFix = Annotated[
+    str,
+    StringConstraints(strict=True, max_length=3_000),
+]
+ReviewListItem = Annotated[
+    str,
+    StringConstraints(
+        strict=True,
+        strip_whitespace=True,
+        min_length=1,
+        max_length=500,
+    ),
+]
 PositiveInteger = Annotated[int, Field(strict=True, gt=0)]
 NonNegativeInteger = Annotated[int, Field(strict=True, ge=0)]
 Confidence = Annotated[float, Field(strict=True, ge=0.0, le=1.0)]
-StrictStringList = Annotated[list[NonEmptyString], Field(strict=True)]
+StrictStringList = Annotated[
+    list[ReviewListItem],
+    Field(strict=True, max_length=20),
+]
+MAX_REVIEW_LIST_ITEMS = 20
 
 
 class ReviewModel(BaseModel):
@@ -34,7 +105,7 @@ class ReviewModel(BaseModel):
     model_config = ConfigDict(
         extra="forbid",
         frozen=True,
-        str_strip_whitespace=True,
+        str_strip_whitespace=False,
         validate_default=True,
     )
 
@@ -86,18 +157,18 @@ class ReviewSide(StrEnum):
 class ReviewFinding(ReviewModel):
     """One actionable, evidence-backed defect in changed code."""
 
-    id: NonEmptyString
-    title: NonEmptyString
-    body: NonEmptyString
+    id: FindingIdentifier
+    title: FindingTitle
+    body: FindingBody
     severity: FindingSeverity
     category: FindingCategory
     confidence: Confidence
-    file_path: NonEmptyString
-    line: PositiveInteger | None = None
-    start_line: PositiveInteger | None = None
-    side: ReviewSide = ReviewSide.RIGHT
-    suggested_fix: StrictStr | None = None
-    evidence: NonEmptyString
+    file_path: FilePath
+    line: PositiveInteger | None
+    start_line: PositiveInteger | None
+    side: ReviewSide
+    suggested_fix: SuggestedFix | None
+    evidence: FindingEvidence
 
     @field_validator("file_path")
     @classmethod
@@ -108,11 +179,7 @@ class ReviewFinding(ReviewModel):
     def _validate_line_range(self) -> Self:
         if self.start_line is not None and self.line is None:
             raise ValueError("start_line requires line")
-        if (
-            self.start_line is not None
-            and self.line is not None
-            and self.start_line > self.line
-        ):
+        if self.start_line is not None and self.line is not None and self.start_line > self.line:
             raise ValueError("start_line cannot be greater than line")
         return self
 
@@ -120,15 +187,16 @@ class ReviewFinding(ReviewModel):
 class ReviewResult(ReviewModel):
     """The complete structured result required from Codex."""
 
-    summary: NonEmptyString
+    summary: SummaryText
     verdict: ReviewVerdict
     confidence: Confidence
     risk_level: RiskLevel
-    findings: Annotated[list[ReviewFinding], Field(strict=True)] = Field(
-        default_factory=list
-    )
-    testing_recommendations: StrictStringList = Field(default_factory=list)
-    limitations: StrictStringList = Field(default_factory=list)
+    findings: Annotated[
+        list[ReviewFinding],
+        Field(strict=True, max_length=50),
+    ]
+    testing_recommendations: StrictStringList
+    limitations: StrictStringList
 
 
 class PullRequestContext(ReviewModel):
@@ -156,4 +224,3 @@ class PullRequestContext(ReviewModel):
 Verdict = ReviewVerdict
 Severity = FindingSeverity
 Category = FindingCategory
-

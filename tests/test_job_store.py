@@ -4,6 +4,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
+from pullsage.exceptions import ReviewCapacityError
 from pullsage.jobs import (
     InMemoryJobStore,
     InvalidJobTransitionError,
@@ -103,16 +104,25 @@ async def test_expired_terminal_jobs_are_removed() -> None:
         now=completed_at,
     )
 
-    assert (
-        await store.cleanup_expired(
-            now=completed_at + timedelta(seconds=9)
-        )
-        == 0
-    )
-    assert (
-        await store.cleanup_expired(
-            now=completed_at + timedelta(seconds=10)
-        )
-        == 1
-    )
+    assert await store.cleanup_expired(now=completed_at + timedelta(seconds=9)) == 0
+    assert await store.cleanup_expired(now=completed_at + timedelta(seconds=10)) == 1
     assert await store.get(job.job_id) is None
+
+
+@pytest.mark.asyncio
+async def test_store_rejects_unbounded_active_job_growth() -> None:
+    store = InMemoryJobStore(max_jobs=1)
+    await store.create_job(
+        owner="octo-org",
+        repository="example",
+        pull_request_number=1,
+        source=JobSource.MANUAL,
+    )
+
+    with pytest.raises(ReviewCapacityError):
+        await store.create_job(
+            owner="octo-org",
+            repository="example",
+            pull_request_number=2,
+            source=JobSource.MANUAL,
+        )

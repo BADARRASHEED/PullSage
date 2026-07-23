@@ -5,9 +5,14 @@ from __future__ import annotations
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, StrictBool
 
-from pullsage.api.dependencies import get_job_store, get_review_queue
+from pullsage.api.dependencies import (
+    get_github_client,
+    get_job_store,
+    get_review_queue,
+)
+from pullsage.github.client import GitHubClient
 from pullsage.jobs.models import JobSource, JobStatus, ReviewJob
 from pullsage.jobs.store import InMemoryJobStore
 from pullsage.jobs.worker import ReviewQueue
@@ -23,7 +28,7 @@ class ManualReviewRequest(BaseModel):
     owner: str = Field(min_length=1, max_length=255)
     repository: str = Field(min_length=1, max_length=255)
     pull_request_number: int = Field(ge=1)
-    post_comments: bool = False
+    post_comments: StrictBool = False
 
 
 class ReviewJobAccepted(BaseModel):
@@ -44,6 +49,7 @@ class ReviewJobAccepted(BaseModel):
 async def create_review(
     payload: ManualReviewRequest,
     queue: ReviewQueue = Depends(get_review_queue),
+    github_client: GitHubClient = Depends(get_github_client),
 ) -> ReviewJobAccepted:
     """Queue an asynchronous review; posting remains opt-in per request."""
 
@@ -55,21 +61,25 @@ async def create_review(
                 "message": "The review queue is not available",
             },
         )
+    pull_request = await github_client.get_pull_request(
+        payload.owner,
+        payload.repository,
+        payload.pull_request_number,
+    )
     job, created = await queue.enqueue_with_status(
         owner=payload.owner,
         repository=payload.repository,
         pull_request_number=payload.pull_request_number,
         source=JobSource.MANUAL,
         post_comments=payload.post_comments,
+        head_sha=pull_request.head_sha,
     )
     return ReviewJobAccepted(
         job_id=job.job_id,
         status=job.status,
         deduplicated=not created,
         message=(
-            "Review job accepted"
-            if created
-            else "An equivalent review job is already active"
+            "Review job accepted" if created else "An equivalent review job is already active"
         ),
     )
 

@@ -8,9 +8,17 @@ from contextlib import suppress
 from typing import TYPE_CHECKING
 from uuid import UUID
 
-from pullsage.exceptions import PullSageError
+from pullsage.exceptions import (
+    JobNotFoundError,
+    PullSageError,
+    ReviewCapacityError,
+    WorkerShutdownError,
+)
 from pullsage.jobs.models import JobSource, JobStatus, ReviewJob
-from pullsage.jobs.store import InMemoryJobStore, JobNotFoundError
+from pullsage.jobs.store import (
+    InMemoryJobStore,
+    InvalidJobTransitionError,
+)
 from pullsage.logging_config import reset_job_id, set_job_id
 
 if TYPE_CHECKING:
@@ -32,16 +40,17 @@ class ReviewQueue:
         concurrency: int = 2,
         retention_seconds: float | None = None,
         cleanup_interval_seconds: float | None = None,
+        max_queue_size: int = 100,
     ) -> None:
         if concurrency < 1:
             raise ValueError("concurrency must be at least 1")
+        if max_queue_size < 1:
+            raise ValueError("max_queue_size must be at least 1")
         self.store = store
         self.review_service = review_service
         self.concurrency = concurrency
         self.retention_seconds = (
-            store.retention_seconds
-            if retention_seconds is None
-            else float(retention_seconds)
+            store.retention_seconds if retention_seconds is None else float(retention_seconds)
         )
         default_interval = max(
             1.0,
@@ -52,7 +61,8 @@ class ReviewQueue:
             if cleanup_interval_seconds is None
             else max(0.1, float(cleanup_interval_seconds))
         )
-        self._queue: asyncio.Queue[UUID | object] = asyncio.Queue()
+        self.max_queue_size = max_queue_size
+        self._queue: asyncio.Queue[UUID | object] = asyncio.Queue(maxsize=max_queue_size)
         self._workers: list[asyncio.Task[None]] = []
         self._cleanup_task: asyncio.Task[None] | None = None
         self._started = False
@@ -160,28 +170,35 @@ class ReviewQueue:
     ) -> tuple[ReviewJob, bool]:
         """Create and enqueue a job, returning ``(job, created)``."""
 
-        if not self.is_running:
-            raise RuntimeError("Review queue is not running")
-        job, created = await self.store.get_or_create_job(
-            owner=owner,
-            repository=repository,
-            pull_request_number=pull_request_number,
-            source=source,
-            post_comments=post_comments,
-            head_sha=head_sha,
-        )
-        if created:
-            await self._queue.put(job.job_id)
-            logger.info(
-                "Review job queued",
-                extra={
-                    "event": "review_job_queued",
-                    "job_id": str(job.job_id),
-                    "repository": f"{job.owner}/{job.repository}",
-                    "pull_request_number": job.pull_request_number,
-                    "source": job.source.value,
-                },
+        # Serialize the short admission section with start/stop so an accepted
+        # job cannot land behind worker shutdown sentinels.
+        async with self._lifecycle_lock:
+            if not self.is_running:
+                raise WorkerShutdownError()
+            job, created = await self.store.get_or_create_job(
+                owner=owner,
+                repository=repository,
+                pull_request_number=pull_request_number,
+                source=source,
+                post_comments=post_comments,
+                head_sha=head_sha,
             )
+            if created:
+                try:
+                    self._queue.put_nowait(job.job_id)
+                except asyncio.QueueFull as error:
+                    await self.store.delete(job.job_id)
+                    raise ReviewCapacityError() from error
+                logger.info(
+                    "Review job queued",
+                    extra={
+                        "event": "review_job_queued",
+                        "job_id": str(job.job_id),
+                        "repository": f"{job.owner}/{job.repository}",
+                        "pull_request_number": job.pull_request_number,
+                        "source": job.source.value,
+                    },
+                )
         return job, created
 
     async def enqueue(self, **kwargs: object) -> ReviewJob:
@@ -204,7 +221,10 @@ class ReviewQueue:
                 await self._process_job(queued_item)  # type: ignore[arg-type]
             except asyncio.CancelledError:
                 if isinstance(queued_item, UUID):
-                    with suppress(Exception):
+                    with suppress(
+                        JobNotFoundError,
+                        InvalidJobTransitionError,
+                    ):
                         await self.store.fail(
                             queued_item,
                             "Review worker stopped before completion",
@@ -232,21 +252,18 @@ class ReviewQueue:
         job = await self.store.require(job_id)
         try:
             await self.store.transition(job_id, JobStatus.FETCHING_CONTEXT)
-            await asyncio.sleep(0)
-            await self.store.transition(job_id, JobStatus.REVIEWING)
+
+            async def update_progress(status: str) -> None:
+                await self.store.transition(job_id, JobStatus(status))
+
             result = await self.review_service.review_pull_request(
                 job.owner,
                 job.repository,
                 job.pull_request_number,
                 post_comments=job.post_comments,
+                progress_callback=update_progress,
+                expected_head_sha=job.head_sha,
             )
-            await self.store.transition(
-                job_id,
-                JobStatus.VALIDATING,
-                result=result,
-            )
-            if job.post_comments:
-                await self.store.transition(job_id, JobStatus.POSTING)
             await self.store.transition(
                 job_id,
                 JobStatus.COMPLETED,
@@ -262,7 +279,7 @@ class ReviewQueue:
                 },
             )
         except asyncio.CancelledError:
-            with suppress(JobNotFoundError, ValueError):
+            with suppress(JobNotFoundError, InvalidJobTransitionError):
                 await self.store.fail(
                     job_id,
                     "Review worker stopped before completion",
@@ -270,7 +287,7 @@ class ReviewQueue:
             raise
         except Exception as exc:
             error_message = self._safe_error_message(exc)
-            with suppress(JobNotFoundError, ValueError):
+            with suppress(JobNotFoundError, InvalidJobTransitionError):
                 await self.store.fail(job_id, error_message)
             logger.exception(
                 "Review job failed",
@@ -294,9 +311,7 @@ class ReviewQueue:
         try:
             while True:
                 await asyncio.sleep(self.cleanup_interval_seconds)
-                removed = await self.store.cleanup_expired(
-                    retention_seconds=self.retention_seconds
-                )
+                removed = await self.store.cleanup_expired(retention_seconds=self.retention_seconds)
                 if removed:
                     logger.info(
                         "Expired review jobs removed",

@@ -174,4 +174,3 @@ class DeliveryCache:
 
 # Explicit name useful in dependency annotations.
 WebhookDeliveryCache = DeliveryCache
-

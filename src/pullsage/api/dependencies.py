@@ -5,7 +5,7 @@ from __future__ import annotations
 import inspect
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, cast
 
 from fastapi import HTTPException, Request, status
 
@@ -47,9 +47,7 @@ ServiceFactory = Callable[
     [Settings],
     ServiceBundle
     | tuple[GitHubClient, CodexRunner, ReviewService]
-    | Awaitable[
-        ServiceBundle | tuple[GitHubClient, CodexRunner, ReviewService]
-    ],
+    | Awaitable[ServiceBundle | tuple[GitHubClient, CodexRunner, ReviewService]],
 ]
 
 
@@ -84,8 +82,7 @@ async def resolve_service_bundle(
             review_service=produced[2],
         )
     raise TypeError(
-        "service_factory must return ServiceBundle or "
-        "(GitHubClient, CodexRunner, ReviewService)"
+        "service_factory must return ServiceBundle or (GitHubClient, CodexRunner, ReviewService)"
     )
 
 
@@ -153,28 +150,28 @@ def _state_dependency(request: Request, name: str) -> Any:
 
 
 def get_settings(request: Request) -> Settings:
-    return _state_dependency(request, "settings")
+    return cast(Settings, _state_dependency(request, "settings"))
 
 
 def get_github_client(request: Request) -> GitHubClient:
-    return _state_dependency(request, "github_client")
+    return cast(GitHubClient, _state_dependency(request, "github_client"))
 
 
 def get_codex_runner(request: Request) -> CodexRunner:
-    return _state_dependency(request, "codex_runner")
+    return cast(CodexRunner, _state_dependency(request, "codex_runner"))
 
 
 def get_review_service(request: Request) -> ReviewService:
-    return _state_dependency(request, "review_service")
+    return cast(ReviewService, _state_dependency(request, "review_service"))
 
 
 def get_job_store(request: Request) -> InMemoryJobStore:
-    return _state_dependency(request, "job_store")
+    return cast(InMemoryJobStore, _state_dependency(request, "job_store"))
 
 
 def get_review_queue(request: Request) -> ReviewQueue:
-    return _state_dependency(request, "review_queue")
+    return cast(ReviewQueue, _state_dependency(request, "review_queue"))
 
 
 def get_delivery_cache(request: Request) -> DeliveryCache:
-    return _state_dependency(request, "delivery_cache")
+    return cast(DeliveryCache, _state_dependency(request, "delivery_cache"))

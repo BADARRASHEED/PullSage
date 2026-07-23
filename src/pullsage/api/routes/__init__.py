@@ -10,4 +10,3 @@ api_router.include_router(reviews_router)
 api_router.include_router(capabilities_router)
 
 __all__ = ["api_router"]
-

@@ -19,4 +19,7 @@ def test_repair_prompt_is_constrained_to_one_json_contract() -> None:
 
     assert "Validation errors:" in prompt
     assert "exactly one JSON object" in prompt
-    assert "Do not execute commands" in prompt
+    assert "Do not run commands" in prompt
+    assert "SECURITY BOUNDARY" in prompt
+    assert "REVIEW TASK" in prompt
+    assert "no session memory" in prompt

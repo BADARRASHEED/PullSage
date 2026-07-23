@@ -17,11 +17,10 @@ from pullsage.reviews.models import (
     ReviewResult,
     ReviewVerdict,
     RiskLevel,
+    MAX_REVIEW_LIST_ITEMS,
 )
 
-_HUNK_HEADER = re.compile(
-    r"^@@ -\d+(?:,\d+)? \+(?P<start>\d+)(?:,(?P<count>\d+))? @@"
-)
+_HUNK_HEADER = re.compile(r"^@@ -\d+(?:,\d+)? \+(?P<start>\d+)(?:,(?P<count>\d+))? @@")
 _SEVERITY_RANK = {
     FindingSeverity.INFO: 0,
     FindingSeverity.LOW: 1,
@@ -41,8 +40,7 @@ _BLOCKING_CATEGORIES = {
     FindingCategory.RELIABILITY,
 }
 NO_FINDINGS_SUMMARY = (
-    "No high-confidence defects were identified in the supplied pull request "
-    "changes."
+    "No high-confidence defects were identified in the supplied pull request changes."
 )
 UNMAPPED_LOCATION_LIMITATION = (
     "One or more findings could not be mapped safely to an added diff line; "
@@ -62,11 +60,14 @@ def coerce_review_result(
     except ValidationError as exc:
         raise ReviewValidationError(
             "Structured review failed schema validation.",
-            validation_errors=exc.errors(
-                include_url=False,
-                include_context=False,
-                include_input=False,
-            ),
+            validation_errors=[
+                dict(error)
+                for error in exc.errors(
+                    include_url=False,
+                    include_context=False,
+                    include_input=False,
+                )
+            ],
         ) from exc
 
 
@@ -86,11 +87,13 @@ def extract_changed_lines(patch: str | None) -> frozenset[int]:
             continue
         if raw_line.startswith("\\"):
             continue
-        if raw_line.startswith("+") and not raw_line.startswith("+++"):
+        # File headers occur before the first hunk. Once inside a hunk, even
+        # source text beginning with "+++" or "---" is an ordinary changed line.
+        if raw_line.startswith("+"):
             changed_lines.add(new_line)
             new_line += 1
             continue
-        if raw_line.startswith("-") and not raw_line.startswith("---"):
+        if raw_line.startswith("-"):
             continue
         new_line += 1
     return frozenset(changed_lines)
@@ -125,11 +128,7 @@ def deduplicate_findings(
     unique: list[ReviewFinding] = []
     for finding in findings:
         duplicate_index = next(
-            (
-                index
-                for index, existing in enumerate(unique)
-                if _duplicate(existing, finding)
-            ),
+            (index for index, existing in enumerate(unique) if _duplicate(existing, finding)),
             None,
         )
         if duplicate_index is None:
@@ -165,10 +164,7 @@ def _safe_location(
     changed_lines = extract_changed_lines(changed_file.patch)
     if finding.line not in changed_lines:
         return None, None
-    if (
-        finding.start_line is not None
-        and finding.start_line not in changed_lines
-    ):
+    if finding.start_line is not None and finding.start_line not in changed_lines:
         return finding.line, None
     return finding.line, finding.start_line
 
@@ -192,20 +188,11 @@ def _consistent_verdict(
     minimum_confidence: float,
 ) -> ReviewVerdict:
     high_impact = any(
-        finding.severity
-        in {FindingSeverity.HIGH, FindingSeverity.CRITICAL}
-        for finding in findings
+        finding.severity in {FindingSeverity.HIGH, FindingSeverity.CRITICAL} for finding in findings
     )
-    blockers = any(
-        _is_meaningful_blocker(finding, minimum_confidence)
-        for finding in findings
-    )
+    blockers = any(_is_meaningful_blocker(finding, minimum_confidence) for finding in findings)
     if verdict is ReviewVerdict.APPROVE and high_impact:
-        return (
-            ReviewVerdict.REQUEST_CHANGES
-            if blockers
-            else ReviewVerdict.COMMENT
-        )
+        return ReviewVerdict.REQUEST_CHANGES if blockers else ReviewVerdict.COMMENT
     if verdict is ReviewVerdict.REQUEST_CHANGES and not blockers:
         return ReviewVerdict.COMMENT
     return verdict
@@ -228,11 +215,7 @@ def _consistent_risk(
         FindingSeverity.HIGH: RiskLevel.HIGH,
         FindingSeverity.CRITICAL: RiskLevel.CRITICAL,
     }[highest_severity]
-    return (
-        minimum_risk
-        if _RISK_RANK[minimum_risk] > _RISK_RANK[risk_level]
-        else risk_level
-    )
+    return minimum_risk if _RISK_RANK[minimum_risk] > _RISK_RANK[risk_level] else risk_level
 
 
 def validate_and_filter_review(
@@ -251,7 +234,7 @@ def validate_and_filter_review(
 
     if (
         isinstance(min_confidence, bool)
-        or not isinstance(min_confidence, (float, int))
+        or not isinstance(min_confidence, float | int)
         or not 0.0 <= float(min_confidence) <= 1.0
     ):
         raise ValueError("min_confidence must be between 0 and 1")
@@ -262,8 +245,7 @@ def validate_and_filter_review(
     eligible = [
         finding
         for finding in result.findings
-        if finding.confidence >= threshold
-        and finding.file_path in changed_by_path
+        if finding.confidence >= threshold and finding.file_path in changed_by_path
     ]
     eligible = deduplicate_findings(eligible)
 
@@ -279,19 +261,18 @@ def validate_and_filter_review(
         elif finding.start_line is not None and start_line is None:
             had_unmapped_location = True
         if line != finding.line or start_line != finding.start_line:
-            finding = finding.model_copy(
-                update={"line": line, "start_line": start_line}
-            )
+            finding = finding.model_copy(update={"line": line, "start_line": start_line})
         mapped_findings.append(finding)
 
     limitations = _deduplicate_strings(result.limitations)
     if had_unmapped_location:
-        limitations = _deduplicate_strings(
-            [*limitations, UNMAPPED_LOCATION_LIMITATION]
-        )
-    testing_recommendations = _deduplicate_strings(
-        result.testing_recommendations
-    )
+        normalized_limitation = _normalize_text(UNMAPPED_LOCATION_LIMITATION)
+        if all(_normalize_text(item) != normalized_limitation for item in limitations):
+            limitations = [
+                *limitations[: MAX_REVIEW_LIST_ITEMS - 1],
+                UNMAPPED_LOCATION_LIMITATION,
+            ]
+    testing_recommendations = _deduplicate_strings(result.testing_recommendations)
     verdict = _consistent_verdict(
         result.verdict,
         mapped_findings,
@@ -299,11 +280,12 @@ def validate_and_filter_review(
     )
     risk_level = _consistent_risk(result.risk_level, mapped_findings)
     summary = result.summary
-    if result.findings and not mapped_findings:
-        summary = NO_FINDINGS_SUMMARY
+    if not mapped_findings:
         risk_level = RiskLevel.LOW
         if verdict is ReviewVerdict.REQUEST_CHANGES:
             verdict = ReviewVerdict.COMMENT
+        if result.findings:
+            summary = NO_FINDINGS_SUMMARY
 
     return ReviewResult(
         summary=summary,
@@ -318,4 +300,3 @@ def validate_and_filter_review(
 
 # Natural short name for callers that already have a structured result.
 validate_review = validate_and_filter_review
-

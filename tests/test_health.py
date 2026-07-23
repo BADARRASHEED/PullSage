@@ -90,3 +90,24 @@ def test_readiness_is_ready_when_all_requirements_are_present() -> None:
     assert response.json()["status"] == "ready"
     assert all(response.json()["checks"].values())
 
+
+def test_capabilities_expose_only_safe_limits_and_switches() -> None:
+    settings = Settings(
+        _env_file=None,
+        post_comments=True,
+        allow_mcp_write_tools=True,
+        max_diff_chars=12_345,
+    )
+    application = create_app(
+        settings,
+        service_factory=_factory(available=True),
+    )
+    with TestClient(application) as client:
+        response = client.get("/api/v1/config/capabilities")
+
+    assert response.status_code == 200
+    assert response.json()["posting_enabled"] is True
+    assert response.json()["mcp_write_tools_enabled"] is True
+    assert response.json()["max_diff_chars"] == 12_345
+    assert "github_token" not in response.text.casefold()
+    assert "webhook_secret" not in response.text.casefold()

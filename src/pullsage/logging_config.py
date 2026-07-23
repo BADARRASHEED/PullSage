@@ -18,6 +18,15 @@ _SENSITIVE_PATTERNS = (
     re.compile(r"(?i)((?:github_)?token\s*[:=]\s*)[^\s,;]+"),
     re.compile(r"(?i)((?:webhook_)?secret\s*[:=]\s*)[^\s,;]+"),
 )
+_BARE_TOKEN_PATTERN = re.compile(
+    r"(?i)\b(?:github_pat_[A-Za-z0-9_]{16,}|gh[pousr]_[A-Za-z0-9]{16,}|"
+    r"sk-[A-Za-z0-9_-]{16,})\b"
+)
+_PRIVATE_KEY_PATTERN = re.compile(
+    r"-----BEGIN(?: [A-Z0-9]+)? PRIVATE KEY-----.*?"
+    r"-----END(?: [A-Z0-9]+)? PRIVATE KEY-----",
+    flags=re.IGNORECASE | re.DOTALL,
+)
 
 
 def _redact(value: str) -> str:
@@ -26,6 +35,8 @@ def _redact(value: str) -> str:
     redacted = value
     for pattern in _SENSITIVE_PATTERNS:
         redacted = pattern.sub(r"\1[REDACTED]", redacted)
+    redacted = _BARE_TOKEN_PATTERN.sub("[REDACTED]", redacted)
+    redacted = _PRIVATE_KEY_PATTERN.sub("[REDACTED PRIVATE KEY]", redacted)
     return redacted
 
 
@@ -33,8 +44,12 @@ class ContextFilter(logging.Filter):
     """Attach correlation identifiers to every record."""
 
     def filter(self, record: logging.LogRecord) -> bool:
-        record.request_id = _request_id.get()
-        record.job_id = _job_id.get()
+        request_id = _request_id.get()
+        job_id = _job_id.get()
+        if request_id != "-" or not hasattr(record, "request_id"):
+            record.request_id = request_id
+        if job_id != "-" or not hasattr(record, "job_id"):
+            record.job_id = job_id
         return True
 
 
@@ -48,6 +63,17 @@ class JsonFormatter(logging.Formatter):
         "duration_ms",
         "status",
         "delivery_id",
+        "codex_duration_ms",
+        "validation_duration_ms",
+        "posting_duration_ms",
+        "finding_count",
+        "posted",
+        "changed_file_count",
+        "diff_truncated",
+        "worker_count",
+        "worker_index",
+        "source",
+        "removed_count",
     )
 
     def format(self, record: logging.LogRecord) -> str:
