@@ -329,8 +329,7 @@ class InMemoryJobStore:
             unexpected = ", ".join(sorted(kwargs))
             raise TypeError(f"Unexpected cleanup arguments: {unexpected}")
         if retention_seconds is not None and (
-            isinstance(retention_seconds, bool)
-            or not isinstance(retention_seconds, int | float)
+            isinstance(retention_seconds, bool) or not isinstance(retention_seconds, int | float)
         ):
             raise TypeError("retention_seconds must be a number or None")
         return await self.cleanup_expired(

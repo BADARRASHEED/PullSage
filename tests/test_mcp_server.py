@@ -117,6 +117,34 @@ async def test_enabled_post_still_requires_structured_review_payload() -> None:
 
 
 @pytest.mark.asyncio
+async def test_enabled_direct_post_requires_reviewed_head_sha() -> None:
+    adapter, _github, review_service = _tools(allow_writes=True)
+
+    response = await adapter.post_review("octo", "example", 7, _review())
+
+    assert response["ok"] is False
+    assert response["error"]["code"] == "review_head_sha_required"
+    review_service.post_review.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_enabled_direct_post_rejects_stale_head_sha() -> None:
+    adapter, _github, review_service = _tools(allow_writes=True)
+
+    response = await adapter.post_review(
+        "octo",
+        "example",
+        7,
+        _review(),
+        head_sha="def5678",
+    )
+
+    assert response["ok"] is False
+    assert response["error"]["code"] == "stale_pull_request_head"
+    review_service.post_review.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_enabled_post_uses_shared_review_service() -> None:
     adapter, _github, review_service = _tools(allow_writes=True)
     review_service.post_review.return_value = _Dumpable({"id": 123, "state": "COMMENTED"})

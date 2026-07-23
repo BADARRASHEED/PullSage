@@ -111,9 +111,9 @@ def test_invalid_inline_line_becomes_general_finding() -> None:
 
 
 def test_system_location_limitation_respects_twenty_item_schema_bound() -> None:
-    review_payload = _review(
-        [_finding("bad-line", confidence=0.95, line=999)]
-    ).model_dump(mode="python")
+    review_payload = _review([_finding("bad-line", confidence=0.95, line=999)]).model_dump(
+        mode="python"
+    )
     review_payload["limitations"] = [f"Caller limitation {index}." for index in range(20)]
     review = ReviewResult.model_validate(review_payload)
 

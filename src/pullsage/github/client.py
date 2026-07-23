@@ -532,14 +532,8 @@ class GitHubClient:
             truncate_response=True,
         )
         content = response.content.decode("utf-8", errors="replace")
-        response_truncated = bool(
-            response.extensions.get("pullsage_body_truncated", False)
-        )
-        original_length = (
-            max(len(content) + 1, limit + 1)
-            if response_truncated
-            else len(content)
-        )
+        response_truncated = bool(response.extensions.get("pullsage_body_truncated", False))
+        original_length = max(len(content) + 1, limit + 1) if response_truncated else len(content)
         if original_length <= limit:
             return PullRequestDiff(
                 content=content,

@@ -11,13 +11,13 @@ from pydantic import ValidationError
 from pullsage.exceptions import ReviewValidationError
 from pullsage.github.models import ChangedFile
 from pullsage.reviews.models import (
+    MAX_REVIEW_LIST_ITEMS,
     FindingCategory,
     FindingSeverity,
     ReviewFinding,
     ReviewResult,
     ReviewVerdict,
     RiskLevel,
-    MAX_REVIEW_LIST_ITEMS,
 )
 
 _HUNK_HEADER = re.compile(r"^@@ -\d+(?:,\d+)? \+(?P<start>\d+)(?:,(?P<count>\d+))? @@")

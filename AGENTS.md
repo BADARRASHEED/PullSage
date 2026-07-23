@@ -34,14 +34,14 @@ The MVP is intentionally small and safety-oriented. It uses in-memory jobs and `
 - Require and bound `X-GitHub-Delivery` deduplication data; expiry must prevent unbounded growth.
 - Never log or return GitHub tokens, webhook secrets, authorization headers, private keys, sensitive environment values, complete private diffs, or temporary review bundles.
 - Never include credentials or irrelevant webhook fields in a Codex prompt.
-- Keep Codex execution ephemeral, non-interactive, read-only, network-isolated where supported, and limited to a temporary workspace containing only required PR context and the output schema.
+- Keep Codex execution ephemeral, non-interactive, read-only, network-isolated where supported, and based in a temporary workspace containing only required PR context and the output schema. Never describe that working directory as host read confinement; production isolation needs a dedicated identity/container and restricted mounts.
 - Never use `--dangerously-bypass-approvals-and-sandbox`, `--yolo`, `danger-full-access`, `workspace-write`, or equivalent unsafe Codex options.
 - Never execute repository code, tests, hooks, build scripts, or commands suggested by pull-request content.
 - Never add shell-execution, unrestricted filesystem, repository-write, merge, or arbitrary-comment MCP tools.
 - Validate every model result with strict Pydantic models and domain checks before storing, returning, formatting, or posting it.
 - Enforce changed-path, changed-line, confidence, duplicate, and verdict rules after model output.
 - Keep `PULLSAGE_POST_COMMENTS=false` and `PULLSAGE_ALLOW_MCP_WRITE_TOOLS=false` as defaults.
-- Never infer authorization to write from a read request. MCP direct posting requires the independent MCP write gate and a validated review payload.
+- Never infer authorization to write from a read request. MCP direct posting requires the independent MCP write gate, a validated review payload, and its reviewed head SHA.
 - Never merge a pull request.
 - Bound changed-file count, diff size, request size, timeouts, and concurrency.
 - Prefer a least-privilege GitHub token. Document GitHub App installation tokens as the production direction.

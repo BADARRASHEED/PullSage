@@ -15,7 +15,7 @@ Both paths use the same GitHub client, Codex runner, validation rules, and revie
 
 ## The problem PullSage solves
 
-Pull-request review automation often has one of two weaknesses: it is tightly coupled to one webhook workflow, or it gives an AI agent more repository access than a review requires. PullSage separates transport from business logic and treats every pull-request field, patch, and diff as untrusted data. Codex receives a bounded review bundle in a temporary workspace, runs without write or network privileges, and must return JSON that passes strict Pydantic validation before it can be shown or posted.
+Pull-request review automation often has one of two weaknesses: it is tightly coupled to one webhook workflow, or it gives an AI agent more repository access than a review requires. PullSage separates transport from business logic and treats every pull-request field, patch, and diff as untrusted data. Codex receives a bounded review bundle in a temporary workspace, runs with a read-only/no-approval policy, and must return JSON that passes strict Pydantic validation before it can be shown or posted. Network and host-file read confinement ultimately depend on the Codex/platform sandbox; production isolation requires a dedicated identity or container.
 
 The result is intended to supplement human review with focused evidence about defects introduced by a pull request—not to replace maintainers, execute untrusted code, or make merge decisions.
 
@@ -24,9 +24,11 @@ The result is intended to supplement human review with focused evidence about de
 - HMAC SHA-256 verification of GitHub webhook bodies before JSON parsing
 - Supported `pull_request` actions: `opened`, `reopened`, `synchronize`, and `ready_for_review`
 - Bounded, expiring delivery-ID cache to reduce duplicate webhook processing
+- One MiB mutating-request limit, a 100-job queue, and a 10,000-record store ceiling
 - Asynchronous in-memory review queue with configurable worker concurrency
 - Duplicate suppression for concurrent reviews of the same pull-request head
-- Async GitHub REST client for metadata, changed files, unified diffs, and review submission
+- Streaming, size-bounded GitHub REST reads for metadata, changed files, and unified diffs
+- Head-SHA verification before and after review, with GitHub posts pinned by `commit_id`
 - Sandboxed, non-interactive `codex exec` integration with a generated JSON Schema
 - One constrained repair attempt when model output is invalid
 - Changed-file, changed-line, confidence, duplicate, and verdict validation
@@ -201,12 +203,15 @@ codex exec
   --output-last-message <temporary-result-path>
   --cd <temporary-workspace>
   -c mcp_servers={}
+  -c shell_environment_policy.inherit="none"
   -
 ```
 
-The prompt is sent on standard input. If `CODEX_MODEL` is set, the configured model is added explicitly; otherwise Codex uses the operator's configured default. PullSage writes only the bounded PR context and output schema to the temporary workspace. It does not clone the repository, run commands from the PR, run tests, grant network access, or use `workspace-write`, `danger-full-access`, `--yolo`, or approval bypass flags.
+The prompt is sent on standard input. If `CODEX_MODEL` is set, the configured model is added explicitly; otherwise Codex uses the operator's configured default. PullSage writes only the bounded PR context and output schema to the temporary workspace, passes an allowlisted subprocess environment that excludes GitHub/PullSage secrets, and bounds stdout, stderr, result-file size, and execution time. It does not clone the repository, run commands from the PR, run tests, or use `workspace-write`, `danger-full-access`, `--yolo`, or approval bypass flags.
 
 PR content is labelled as untrusted. The prompt tells Codex to ignore instructions embedded in source, comments, strings, documentation, commit messages, and diffs. The final JSON is validated independently; invalid output receives at most one constrained repair attempt.
+
+The temporary directory is a working-directory and write boundary, not a guarantee that a same-account process cannot read other host files. The prompt forbids network and secret access, but the effective network/filesystem policy comes from the installed Codex CLI and OS sandbox. Use a dedicated service account or container with restricted mounts and egress for high-assurance deployments. Codex descendants also need OS/container-level lifecycle control for guaranteed process-tree termination on Windows.
 
 ## Why there is no database
 
@@ -399,7 +404,7 @@ The UUID above is illustrative; use the `job_id` returned by the enqueue request
 | `pullsage_get_changed_files` | Read | Return bounded changed-file metadata and available patches |
 | `pullsage_get_pull_request_diff` | Read | Return a bounded unified diff and truncation information |
 | `pullsage_review_pull_request` | Read by default | Run the shared review service; `post_comments` defaults to `false` |
-| `pullsage_post_review` | Write-gated | Validate a structured review and submit it to GitHub |
+| `pullsage_post_review` | Write-gated | Validate a structured review plus its reviewed `head_sha`, then submit it |
 
 Every MCP result is an object with `ok: true` plus the tool-specific `pull_request`, `changed_files`, `diff`, `review`/`posted`, or `posted_review` field. Safe failures use `{"ok": false, "error": {"code": "...", "message": "..."}}`.
 
@@ -414,7 +419,7 @@ Use pullsage_review_pull_request for octo-org/example pull request 42.
 Keep post_comments false and summarize only the validated result.
 ```
 
-The MCP server never offers merge, shell, repository-write, or arbitrary-comment tools. The post tool accepts only a validated review payload.
+The MCP server never offers merge, shell, repository-write, or arbitrary-comment tools. The post tool accepts only a validated review payload, requires its reviewed `head_sha`, rejects a stale head, and suppresses another post for the same repo/PR/head within the process-local idempotency window.
 
 ## Example structured review
 
@@ -496,15 +501,15 @@ PullSage is designed around untrusted input and explicit write gates:
 
 - Webhook HMAC verification occurs over the raw request body before parsing.
 - GitHub tokens and webhook secrets are never returned from capability or health endpoints.
-- Codex receives only bounded review context, not credentials or the webhook payload.
-- Codex runs ephemerally in a temporary workspace with a read-only sandbox, no approval prompts, and no repository execution.
+- PullSage deliberately passes only bounded review context—not GitHub credentials or the webhook payload—to Codex.
+- Codex runs ephemerally with a temporary working directory, a scrubbed environment, a read-only sandbox, no approval prompts, and no repository execution.
 - The prompt explicitly treats source, prose, commits, patches, and diffs as data—not instructions.
 - Generated output must pass strict schema and domain validation.
 - GitHub posting defaults to disabled with `PULLSAGE_POST_COMMENTS=false`.
 - MCP writes have an independent default-off gate: `PULLSAGE_ALLOW_MCP_WRITE_TOOLS=false`.
 - The service has no merge endpoint or merge MCP tool.
 - Logs omit authorization values, secrets, entire private diffs, and sensitive environment data.
-- Size and file-count limits bound cost and exposure.
+- Request, queue, store, response, result, file-count, and concurrency limits bound cost and exposure.
 
 These controls reduce risk; they do not make model output authoritative. See [Security](docs/security.md) for the threat model and residual risks.
 
@@ -517,7 +522,7 @@ PULLSAGE_POST_COMMENTS=false
 PULLSAGE_ALLOW_MCP_WRITE_TOOLS=false
 ```
 
-Automated webhooks follow `PULLSAGE_POST_COMMENTS`. A manual API request explicitly opts in with `post_comments: true`; its default is false, so do not expose that endpoint without caller authorization in production. MCP review calls with `post_comments: true` and direct `pullsage_post_review` calls both require the separate MCP write gate. Direct posting also requires a valid structured payload. Enable only the write path you intend to use, with a least-privilege token. PullSage never merges.
+Automated webhooks follow `PULLSAGE_POST_COMMENTS`. A manual API request explicitly opts in with the strict JSON boolean `post_comments: true`; its default is false, so do not expose that endpoint without caller authentication, repository authorization, and rate limiting in production. MCP review calls with `post_comments: true` and direct `pullsage_post_review` calls both require the separate MCP write gate. Direct posting also requires a valid structured payload and the exact reviewed head SHA. Enable only the write path you intend to use, with a least-privilege token. PullSage never merges.
 
 ## Tests and quality checks
 
@@ -556,6 +561,9 @@ See [Troubleshooting](docs/troubleshooting.md) for diagnostic steps that do not 
 - AI review can miss defects or produce incorrect findings despite validation.
 - STDIO MCP is local; no remote MCP transport is mounted in FastAPI.
 - There is no tenant identity, policy engine, audit database, or durable rate control.
+- The temporary Codex working directory does not confine same-account reads of other host files.
+- Timeout cleanup guarantees the direct Codex child is bounded; descendant process-tree control is platform-dependent.
+- The manual review/status API has no built-in caller authentication or repository authorization.
 
 ## Production-readiness gaps
 
@@ -566,7 +574,8 @@ Before exposing PullSage as a shared service, add:
 - API authentication and authorization for manual review/status endpoints;
 - multi-replica coordination, backpressure, quotas, and abuse controls;
 - managed secret injection and key rotation;
-- TLS termination, hardened ingress, request-size limits, and production observability;
+- TLS termination, hardened ingress, stricter per-route limits, and production observability;
+- dedicated Codex worker identities/containers with restricted mounts, egress, and process-tree lifecycle;
 - an audit trail for write authorization and GitHub review IDs;
 - explicit data-retention, privacy, and model-governance policies;
 - load, chaos, and end-to-end tests in a controlled staging environment.

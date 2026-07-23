@@ -11,9 +11,9 @@ The MVP is designed for a trusted operator on a single machine or a narrowly exp
 PullSage aims to:
 
 - authenticate GitHub webhook deliveries before parsing them;
-- give GitHub credentials only to the GitHub HTTP client;
+- deliberately pass GitHub credentials only to the GitHub HTTP client;
 - keep PR content and model output untrusted;
-- prevent PR content from causing command, network, secret, or file-write activity;
+- reduce the ability of PR content to cause command, network, secret, or file-write activity;
 - keep GitHub writes disabled unless an operator and caller explicitly authorize them;
 - validate and bound all data that can be posted;
 - avoid leaking secrets or complete private diffs through responses and logs;
@@ -177,7 +177,9 @@ Prompt wording is defense in depth, not a sandbox. PullSage therefore also limit
 - cleanup after success, failure, cancellation, or timeout;
 - isolation from unrelated user rules, hooks, and MCP integrations where the installed Codex version supports it.
 
-PullSage's prompt prohibits network use. The effective technical network restriction also depends on the Codex CLI/platform sandbox implementation; production operators should verify that behaviour for their OS and Codex version rather than relying only on prose.
+PullSage also passes an allowlisted environment that excludes GitHub and PullSage secrets and configures Codex shell environment inheritance to `none`. Codex/OpenAI authentication and required OS variables remain available to the CLI.
+
+**Residual host-read risk:** `--sandbox read-only` blocks writes but is not guaranteed to confine reads to the temporary working directory. Because the child runs as the same OS identity, malicious PR content could attempt to read `.env`, Codex credentials, or other files that identity can access. The prompt and environment scrub reduce exposure but do not form a filesystem boundary. A production deployment must run Codex under a dedicated identity or container with restricted mounts and outbound network policy. Verify the installed Codex/OS sandbox rather than relying on prose.
 
 ## Model-output safety
 
@@ -226,7 +228,7 @@ The webhook secret is used only for HMAC verification. It must differ from the t
 
 ### Codex credentials
 
-Codex authentication is owned by the local Codex CLI. PullSage does not read or forward those credentials. Temporary review context must not be placed in a global Codex history by PullSage; ephemeral mode reduces persistence, subject to Codex's installed-version behaviour.
+Codex authentication is owned by the local CLI. PullSage allowlists Codex/OpenAI authentication variables needed to start it but never includes their values in the review prompt or logs. Same-account filesystem access remains a residual risk as described above. Temporary review context must not be placed in a global Codex history by PullSage; ephemeral mode reduces persistence, subject to installed-version behaviour.
 
 ## Write controls
 
@@ -243,7 +245,7 @@ Automated webhook jobs follow `PULLSAGE_POST_COMMENTS`. Manual API requests are 
 
 ### MCP posting
 
-Read tools never write. The recommended review call uses `post_comments=false`. Both a review call with `post_comments=true` and `pullsage_post_review` fail unless the MCP write gate is true. The direct post tool also requires a schema-valid review and does not accept arbitrary free-form text.
+Read tools never write. The recommended review call uses `post_comments=false`. Both a review call with `post_comments=true` and `pullsage_post_review` fail unless the MCP write gate is true. The direct post tool also requires a schema-valid review plus its reviewed head SHA, rejects a changed head, suppresses repeat posts for that head within one MCP process, and does not accept arbitrary free-form text.
 
 The MCP surface has no:
 
@@ -269,9 +271,9 @@ The following settings bound review work:
 | `PULLSAGE_DELIVERY_RETENTION_SECONDS` | `3600` | Bounds delivery-ID lifetime |
 | `PULLSAGE_MAX_WEBHOOK_DELIVERIES` | `10000` | Bounds cached delivery-ID count |
 
-The model repair count is fixed at one.
+Additional fixed bounds are: 1 MiB per mutating HTTP request, 100 queued jobs, 10,000 retained job records, 20,000 PR-body characters, 50 findings, 20 recommendations/limitations, 60,000 GitHub-review characters, a 2,000,000-character Codex result, and 256 KiB of retained stderr.
 
-Truncation reduces context and must be reported as a review limitation. Some oversized pull requests are rejected rather than partially reviewed. Production ingress should additionally enforce body size, queue depth, rate limits, and per-principal quotas.
+Truncation reduces context and is reported as a review limitation. GitHub bodies are acquired through streaming byte ceilings, and some oversized pull requests are rejected rather than partially reviewed. Production ingress should enforce tighter route-specific body limits, rate limits, and per-principal quotas.
 
 ## GitHub API protections
 
@@ -300,6 +302,8 @@ Temporary workspaces:
 - are removed promptly.
 
 Deletion does not guarantee forensic erasure on every filesystem. Operators with stronger confidentiality requirements should use encrypted storage, hardened ephemeral workers, and verified Codex retention controls.
+
+Timeout/cancellation kills and reaps the direct Codex child with a secondary safety timeout. Descendant process-tree termination is platform-dependent, especially on Windows; use a container, Windows Job Object, or equivalent supervisor when a hard tree-lifecycle guarantee is required.
 
 ## Logging and error redaction
 

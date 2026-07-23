@@ -65,6 +65,7 @@ Common codes include:
 | Code | Meaning |
 | --- | --- |
 | `validation_error` | Request fields failed validation |
+| `request_body_too_large` | Mutating request exceeded the 1 MiB body limit |
 | `invalid_webhook_signature` | Signature is missing, malformed, or incorrect |
 | `missing_github_event` | `X-GitHub-Event` is absent |
 | `missing_github_delivery` | `X-GitHub-Delivery` is absent |
@@ -84,6 +85,8 @@ Common codes include:
 | `review_posting_error` | GitHub did not accept the review submission |
 | `job_not_found` | Job ID is unknown, expired, or lost on restart |
 | `queue_unavailable` | Worker queue is starting or shutting down |
+| `review_capacity_exceeded` | The bounded queue/store cannot admit more work |
+| `stale_pull_request_head` | The PR head changed before review/post completion |
 | `internal_error` | Unexpected server failure |
 
 ## Endpoint summary
@@ -220,7 +223,7 @@ Validates and enqueues a manual pull-request review.
 | `owner` | string | yes | Non-empty GitHub repository owner |
 | `repository` | string | yes | Non-empty GitHub repository name, without owner |
 | `pull_request_number` | integer | yes | Greater than zero |
-| `post_comments` | boolean | no | Defaults to `false` |
+| `post_comments` | strict JSON boolean | no | Defaults to `false`; strings/numbers are rejected |
 
 `post_comments=true` is the manual endpoint's explicit write authorization. It can post even when automated webhook posting is disabled, so keep the default false and do not expose this endpoint to untrusted callers. `PULLSAGE_POST_COMMENTS` controls automated webhook jobs; it is not required for an explicitly authorized manual request.
 
@@ -245,10 +248,12 @@ When equivalent work is already active, the endpoint returns `202` with the acti
 | --- | --- |
 | `202` | New job accepted |
 | `202` | Equivalent active work deduplicated to an existing job |
+| `413` | Request body exceeded 1 MiB |
+| `429` | Queue/store capacity is full |
 | `422` | Request validation failed |
 | `503` | Queue is unavailable during startup or shutdown |
 
-GitHub and Codex failures normally occur after admission and appear as a terminal `failed` job rather than changing the original `202`.
+The endpoint first fetches current PR metadata to bind the job to its head SHA, so GitHub authentication, rate-limit, and not-found failures can occur before `202`. Codex failures occur after admission and appear as a terminal `failed` job.
 
 ### cURL example
 
@@ -299,7 +304,7 @@ Returns one job from the current API process.
   "pull_request_number": 42,
   "source": "manual",
   "post_comments": false,
-  "head_sha": null,
+  "head_sha": "0123456789abcdef0123456789abcdef01234567",
   "status": "reviewing",
   "created_at": "2026-07-23T10:15:00Z",
   "started_at": "2026-07-23T10:15:01Z",
@@ -321,7 +326,7 @@ Returns one job from the current API process.
   "pull_request_number": 42,
   "source": "manual",
   "post_comments": false,
-  "head_sha": null,
+  "head_sha": "0123456789abcdef0123456789abcdef01234567",
   "status": "completed",
   "created_at": "2026-07-23T10:15:00Z",
   "started_at": "2026-07-23T10:15:01Z",
@@ -355,7 +360,7 @@ The job resource still returns `200 OK`; failure is part of the asynchronous job
   "pull_request_number": 42,
   "source": "manual",
   "post_comments": false,
-  "head_sha": null,
+  "head_sha": "0123456789abcdef0123456789abcdef01234567",
   "status": "failed",
   "created_at": "2026-07-23T10:15:00Z",
   "started_at": "2026-07-23T10:15:01Z",
@@ -441,6 +446,8 @@ Duplicate deliveries use `status: "duplicate"` with `reason: "GitHub delivery wa
 | `202` | Accepted or safely ignored verified delivery |
 | `400` | Verified body is malformed or lacks required pull-request identifiers |
 | `401` | Signature header is missing or the signature is invalid |
+| `413` | Raw request body exceeded 1 MiB |
+| `429` | Queue/store capacity is full |
 | `503` | Webhook secret is unconfigured or worker queue is unavailable |
 
 ### cURL shape

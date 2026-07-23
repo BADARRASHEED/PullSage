@@ -92,11 +92,11 @@ ReviewListItem = Annotated[
 PositiveInteger = Annotated[int, Field(strict=True, gt=0)]
 NonNegativeInteger = Annotated[int, Field(strict=True, ge=0)]
 Confidence = Annotated[float, Field(strict=True, ge=0.0, le=1.0)]
+MAX_REVIEW_LIST_ITEMS = 20
 StrictStringList = Annotated[
     list[ReviewListItem],
-    Field(strict=True, max_length=20),
+    Field(strict=True, max_length=MAX_REVIEW_LIST_ITEMS),
 ]
-MAX_REVIEW_LIST_ITEMS = 20
 
 
 class ReviewModel(BaseModel):

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Any
+from typing import Any, cast
 from uuid import uuid4
 
 from pullsage.logging_config import (
@@ -62,20 +62,35 @@ class RequestIDMiddleware:
             if scope.get("method", "").upper() in _BODY_METHODS:
                 messages: list[dict[str, Any]] = []
                 body_size = 0
-                too_large = False
-                while True:
-                    message = await receive()
-                    messages.append(message)
-                    if message["type"] == "http.disconnect":
-                        break
-                    if message["type"] != "http.request":
-                        continue
-                    body_size += len(message.get("body", b""))
-                    if body_size > _MAX_REQUEST_BODY_BYTES:
-                        too_large = True
-                        break
-                    if not message.get("more_body", False):
-                        break
+                content_length = next(
+                    (
+                        value
+                        for key, value in scope.get("headers", ())
+                        if key.lower() == b"content-length"
+                    ),
+                    None,
+                )
+                try:
+                    too_large = (
+                        content_length is not None
+                        and int(content_length) > _MAX_REQUEST_BODY_BYTES
+                    )
+                except ValueError:
+                    too_large = False
+                if not too_large:
+                    while True:
+                        message = await receive()
+                        messages.append(message)
+                        if message["type"] == "http.disconnect":
+                            break
+                        if message["type"] != "http.request":
+                            continue
+                        body_size += len(message.get("body", b""))
+                        if body_size > _MAX_REQUEST_BODY_BYTES:
+                            too_large = True
+                            break
+                        if not message.get("more_body", False):
+                            break
 
                 if too_large:
                     payload = json.dumps(
@@ -115,7 +130,7 @@ class RequestIDMiddleware:
                         message = messages[message_index]
                         message_index += 1
                         return message
-                    return await receive()
+                    return cast(dict[str, Any], await receive())
 
                 bounded_receive = replay_receive
 

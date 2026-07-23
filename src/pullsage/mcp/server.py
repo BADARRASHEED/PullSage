@@ -83,9 +83,7 @@ class PullSageMCPTools:
         self._post_cache: OrderedDict[str, float] = OrderedDict()
         self._posts_in_flight: set[str] = set()
         self._post_cache_lock = asyncio.Lock()
-        self._review_semaphore = asyncio.Semaphore(
-            max(1, int(settings.max_concurrent_reviews))
-        )
+        self._review_semaphore = asyncio.Semaphore(max(1, int(settings.max_concurrent_reviews)))
 
     async def aclose(self) -> None:
         """Release the shared HTTP client on server shutdown."""

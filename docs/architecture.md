@@ -92,7 +92,9 @@ Each attempt uses a fresh temporary workspace containing only:
 - Pydantic's generated JSON output schema;
 - the final result file written by Codex.
 
-The subprocess receives the prompt through standard input and uses ephemeral, read-only, no-approval arguments. It does not clone the repository, execute repository code, run tests, or receive GitHub credentials. A timeout bounds each attempt. Invalid JSON/schema output gets one constrained repair attempt, never an open-ended retry loop.
+The subprocess receives the prompt through standard input and uses ephemeral, read-only, no-approval arguments. PullSage does not clone the repository, execute repository code, run tests, or deliberately pass GitHub credentials. Its allowlisted process environment and `shell_environment_policy.inherit="none"` exclude GitHub/PullSage secrets. A timeout plus bounded stdout, stderr, and result-file capture limits each attempt. Invalid JSON/schema output gets one constrained repair attempt, never an open-ended retry loop.
+
+The temporary workspace is not an OS read-isolation boundary: a same-account subprocess may be able to read other host paths allowed by the platform sandbox. Likewise, killing the direct child does not guarantee descendant-tree termination on every OS. Production workers need a dedicated service identity or container with restricted mounts, egress, and process lifecycle.
 
 ### Strict output plus independent domain validation
 
@@ -160,7 +162,7 @@ The MCP entry point creates its own settings, GitHub client, runner, and review 
 - general GitHub API failure;
 - review posting failure.
 
-It sends the GitHub API version header and the appropriate media type, including unified-diff retrieval. Limits are checked while gathering context so overly large PRs do not flow to Codex.
+It sends the GitHub API version header and the appropriate media type, including unified-diff retrieval. Response streams are read through byte ceilings; diff reads retain only the bounded prefix needed for configured character truncation. Limits are checked while gathering context so overly large PRs do not flow to Codex.
 
 ### Webhook boundary
 
@@ -270,7 +272,7 @@ No webhook secret, GitHub token, authorization header, or irrelevant delivery pa
 
 Read tools call `GitHubClient` directly for a single bounded operation. `pullsage_review_pull_request` calls `ReviewService` and waits from the MCP user's perspective while the implementation remains asynchronous. It does not enqueue an API job and does not return a job ID.
 
-`pullsage_post_review` first checks the MCP write gate, validates the complete structured payload, applies review validation/formatting rules, then delegates a bounded review submission to `GitHubClient`. An arbitrary string comment is never accepted.
+`pullsage_post_review` first checks the MCP write gate, requires the reviewed head SHA, validates the complete structured payload, rejects a changed head, applies review validation/formatting rules, then delegates a commit-pinned review submission to `GitHubClient`. An arbitrary string comment is never accepted. A bounded process-local cache suppresses a second MCP post for the same repository/PR/head.
 
 ## Concurrency model
 
@@ -290,7 +292,7 @@ This is concurrency, not durability. A subprocess termination, process crash, or
 
 ### MCP process
 
-Tool calls use async GitHub/review services under the MCP SDK. No API queue or store is shared. Host and SDK concurrency still encounters upstream GitHub limits and local Codex capacity; production deployments should add explicit per-client quotas.
+Tool calls use async GitHub/review services under the MCP SDK. No API queue or store is shared. A process-local semaphore applies `PULLSAGE_MAX_CONCURRENT_REVIEWS` to overlapping MCP review calls. Production deployments still need authenticated per-client quotas.
 
 ## Bounds and backpressure
 
@@ -298,17 +300,23 @@ PullSage applies several independent bounds:
 
 | Bound | Configuration or mechanism |
 | --- | --- |
-| Concurrent API reviews | `PULLSAGE_MAX_CONCURRENT_REVIEWS` |
+| Mutating HTTP body | 1 MiB ASGI admission limit |
+| API queue | 100 pending job IDs |
+| Retained job records | 10,000; terminal records are evicted first |
+| Concurrent API and MCP reviews | `PULLSAGE_MAX_CONCURRENT_REVIEWS` per process |
 | Changed files | `PULLSAGE_MAX_CHANGED_FILES` |
-| Unified diff characters | `PULLSAGE_MAX_DIFF_CHARS` |
+| GitHub response acquisition | Streaming byte ceilings |
+| Unified diff / aggregate patches | `PULLSAGE_MAX_DIFF_CHARS` |
+| PR body | 20,000 characters |
+| Review findings / list items | 50 / 20 |
+| GitHub review Markdown | 60,000 characters |
+| Codex result / stderr capture | 2,000,000 characters / 256 KiB |
 | Codex attempt duration | `CODEX_TIMEOUT_SECONDS` |
 | Model repair attempts | One |
 | Terminal job lifetime | `PULLSAGE_JOB_RETENTION_SECONDS` |
 | Delivery-cache lifetime | `PULLSAGE_DELIVERY_RETENTION_SECONDS` |
 | Delivery-cache entries | `PULLSAGE_MAX_WEBHOOK_DELIVERIES` |
 | HTTP calls | Client request timeout and pagination limits |
-
-Queue depth and request body limits should become explicit deployment controls before public production exposure.
 
 ## Failure handling
 
@@ -319,6 +327,8 @@ Expected failures are domain exceptions translated into safe HTTP and MCP errors
 | Invalid/missing webhook signature | Reject before parsing with HTTP `401` |
 | Unsupported event/action or draft | Safe acknowledgement; no job |
 | Duplicate delivery/active head | Safe acknowledgement or existing-job response; no duplicate work |
+| Request/job capacity exceeded | HTTP `413` or `429`; work is not admitted |
+| PR head changed | Typed stale-head failure; no review is posted |
 | Missing GitHub/Codex configuration | Degraded readiness; review fails safely if attempted |
 | GitHub authentication failure | Typed safe error; token never echoed |
 | GitHub rate limit | Typed error; safe retry/reset information if available |

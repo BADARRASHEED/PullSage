@@ -298,7 +298,8 @@ Representative result:
       "patch": "@@ -20,3 +20,12 @@\n..."
     }
   ],
-  "count": 1
+  "count": 1,
+  "patches_truncated": false
 }
 ```
 
@@ -398,6 +399,7 @@ Conceptual input:
   "owner": "octo-org",
   "repository": "example",
   "pull_request_number": 42,
+  "head_sha": "0123456789abcdef0123456789abcdef01234567",
   "review": {
     "summary": "One high-confidence reliability defect was identified.",
     "verdict": "request_changes",
@@ -412,13 +414,13 @@ Conceptual input:
 }
 ```
 
-The complete `review` object must satisfy the strict PullSage schema. The tool does not accept a free-form comment string. It fails safely unless:
+The complete `review` object must satisfy the strict PullSage schema, and `head_sha` must identify the exact commit that was reviewed. The tool does not accept a free-form comment string. It fails safely unless:
 
 ```dotenv
 PULLSAGE_ALLOW_MCP_WRITE_TOOLS=true
 ```
 
-The server revalidates the payload and applies formatting/line-safety rules. It never merges and does not turn arbitrary findings into unsafe inline comments.
+The server revalidates the payload, verifies the PR still has that head, and applies formatting/line-safety rules. The GitHub submission is pinned with `commit_id`. It never merges and does not turn arbitrary findings into unsafe inline comments. A process-local, bounded TTL cache rejects a second post for the same repository/PR/head with `duplicate_review_post`.
 
 A successful post returns:
 
@@ -458,7 +460,7 @@ Summarize the validated findings and limitations. Do not post anything.
 3. Have a human inspect the exact validated review.
 4. Enable the MCP write setting only in the intended process environment.
 5. Restart the MCP server/host so it receives the setting.
-6. Call `pullsage_post_review` with that reviewed structured payload.
+6. Call `pullsage_post_review` with that reviewed structured payload and the exact reviewed `head_sha`.
 7. Disable the setting again when ongoing write access is unnecessary.
 
 Use a GitHub token with pull-request write permission only for step 6. PullSage does not infer consent from prior read calls.
@@ -474,6 +476,8 @@ MCP tools convert expected failures into concise, non-sensitive errors, includin
 - invalid structured output after one repair;
 - malformed tool arguments;
 - write tool disabled;
+- missing or stale reviewed head SHA;
+- duplicate post for the same pull-request head;
 - review submission rejected by GitHub.
 
 If an error includes a request/correlation identifier, use it to locate redacted server logs. Do not ask the host to echo a token or private diff.
