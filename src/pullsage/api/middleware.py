@@ -72,8 +72,7 @@ class RequestIDMiddleware:
                 )
                 try:
                     too_large = (
-                        content_length is not None
-                        and int(content_length) > _MAX_REQUEST_BODY_BYTES
+                        content_length is not None and int(content_length) > _MAX_REQUEST_BODY_BYTES
                     )
                 except ValueError:
                     too_large = False
